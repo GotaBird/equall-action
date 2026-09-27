@@ -56,3 +56,4 @@ Every finding is also listed in the job summary: GitHub shows at most ten annota
 ## License
 
 MIT
+
