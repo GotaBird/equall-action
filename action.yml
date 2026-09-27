@@ -1,0 +1,63 @@
+name: 'Equall accessibility check'
+description: 'Fail a pull request only on the WCAG violations it introduces. Existing debt never blocks.'
+author: 'Equall'
+branding:
+  icon: 'eye'
+  color: 'purple'
+
+inputs:
+  fail-on:
+    description: 'Fail when the change introduces a violation at this severity or above: critical, serious, moderate or minor.'
+    required: false
+    default: 'critical'
+  path:
+    description: 'Path to scan, relative to the repository root.'
+    required: false
+    default: '.'
+  base:
+    description: 'Git ref to compare against. Defaults to the pull request target branch.'
+    required: false
+    default: ''
+  level:
+    description: 'WCAG conformance target: A, AA or AAA.'
+    required: false
+    default: 'AA'
+  version:
+    description: 'equall-cli version range to run.'
+    required: false
+    default: '^0.3.2'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Fetch the history the comparison needs
+      shell: bash
+      env:
+        BASE_INPUT: ${{ inputs.base }}
+      run: |
+        set -euo pipefail
+        if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+          git fetch --no-tags --prune --unshallow origin
+        fi
+        if [ -z "$BASE_INPUT" ] && [ -n "${GITHUB_BASE_REF:-}" ]; then
+          git fetch --no-tags origin "+refs/heads/${GITHUB_BASE_REF}:refs/remotes/origin/${GITHUB_BASE_REF}"
+        fi
+
+    - name: Equall
+      shell: bash
+      env:
+        FAIL_ON: ${{ inputs.fail-on }}
+        SCAN_PATH: ${{ inputs.path }}
+        BASE_INPUT: ${{ inputs.base }}
+        LEVEL: ${{ inputs.level }}
+        EQUALL_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        if [ -n "$BASE_INPUT" ]; then
+          npx --yes "equall-cli@${EQUALL_VERSION}" scan "$SCAN_PATH" --level "$LEVEL" --diff "$BASE_INPUT" --fail-on "$FAIL_ON"
+        elif [ -n "${GITHUB_BASE_REF:-}" ]; then
+          npx --yes "equall-cli@${EQUALL_VERSION}" scan "$SCAN_PATH" --level "$LEVEL" --diff --fail-on "$FAIL_ON"
+        else
+          echo "::notice title=Equall::Not a pull request: running a report-only scan. The gate applies to pull requests."
+          npx --yes "equall-cli@${EQUALL_VERSION}" scan "$SCAN_PATH" --level "$LEVEL"
+        fi
