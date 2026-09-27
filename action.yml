@@ -36,6 +36,9 @@ runs:
         BASE_INPUT: ${{ inputs.base }}
       run: |
         set -euo pipefail
+        if [ "${GITHUB_EVENT_NAME:-}" = "pull_request_target" ]; then
+          echo "::warning title=Equall::pull_request_target checks out the base branch, not the pull request, so there is nothing to compare. Use the pull_request event."
+        fi
         if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
           git fetch --no-tags --prune --unshallow origin
         fi

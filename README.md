@@ -41,10 +41,13 @@ Each new finding is annotated on its file and line in the pull request.
 | New finding static analysis cannot confirm, or best practice | no | notice annotation |
 | Violation that already existed | no | one summary line |
 | Changed file that cannot be statically tested (CSS, scripts…) | no | summary line |
+| Changed file a scanner could not analyse (parse error) | no | warning annotation: its findings are unknown |
 
 A passing check means no new violation was found statically. Contrast, focus order and other checks that need a rendered page still need their own test.
 
-Outside a pull request (for example on `push`), the Action runs a report-only scan and never fails.
+Outside a pull request (for example on `push`), the Action runs a report-only scan and never fails. Use the `pull_request` event: `pull_request_target` checks out the base branch, so there would be nothing to compare.
+
+Every finding is also listed in the job summary: GitHub shows at most ten annotations of each kind per step.
 
 ## Exit codes
 
