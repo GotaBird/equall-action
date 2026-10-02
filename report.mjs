@@ -97,6 +97,18 @@ export function buildClosed({ event, projectKey }) {
 }
 
 // What to do with a response: 2xx is done, 5xx and 429 are retried, anything else is final.
+// The identity token only travels over HTTPS (plain HTTP is allowed on loopback, for tests).
+export function isAllowedUrl(raw) {
+  let u
+  try {
+    u = new URL(raw)
+  } catch {
+    return false
+  }
+  if (u.protocol === 'https:') return true
+  return u.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(u.hostname)
+}
+
 export function classify(status) {
   if (status >= 200 && status < 300) return 'ok'
   if (status === 429 || status >= 500) return 'retry'
@@ -181,6 +193,10 @@ async function main(argv, env) {
   const [mode, resultPath, exitCodeArg] = argv
   const url = env.EQUALL_REPORT_TO
   const projectKey = env.EQUALL_PROJECT_KEY
+  if (!isAllowedUrl(url)) {
+    warning('report-to must be an https:// URL: nothing reported.')
+    return
+  }
   const event = JSON.parse(readFileSync(env.GITHUB_EVENT_PATH, 'utf8'))
 
   let envelope

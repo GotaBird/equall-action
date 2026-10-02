@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildCheck, buildClosed, classify, send } from '../report.mjs'
+import { buildCheck, buildClosed, classify, isAllowedUrl, send } from '../report.mjs'
 
 const KEY = '9f3b6b1a-2e4e-4b3a-8f1a-6b2a7b2c9d10'
 
@@ -170,4 +170,13 @@ test('send: a network error is retried, then reported as status 0', async () => 
   const out = await send({ url: 'http://x', token: 't', body: '{}', delays: [0], fetchImpl: async () => { n++; throw new Error('ECONNREFUSED') } })
   assert.equal(out.status, 0)
   assert.equal(n, 2)
+})
+
+test('report-to: https only, plain http on loopback for tests', () => {
+  assert.equal(isAllowedUrl('https://example.com/ingest'), true)
+  assert.equal(isAllowedUrl('http://127.0.0.1:8787/ingest'), true)
+  assert.equal(isAllowedUrl('http://localhost:8787/'), true)
+  assert.equal(isAllowedUrl('http://example.com/ingest'), false)
+  assert.equal(isAllowedUrl('ftp://example.com'), false)
+  assert.equal(isAllowedUrl('not a url'), false)
 })

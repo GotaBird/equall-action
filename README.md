@@ -85,7 +85,7 @@ jobs:
 - **URL**: this URL may change before 1.0; the project's settings on Equall show the current one.
 - **Authentication**: `id-token: write` lets the Action request a short-lived GitHub identity token, which proves the report comes from this repository's own workflow. There is no secret to store. The token is never printed.
 - **Project key**: copy it from the project's settings on Equall into a repository variable named `EQUALL_PROJECT_KEY`. It routes the report to that project; on its own, without this repository's identity token, it is useless.
-- **Events**: `opened`, `synchronize` and `reopened` run the check and report it. `closed` reports that the pull request was merged or closed, without scanning. `edited` runs the check; it is reported only when the base branch changed.
+- **Events**: `opened`, `synchronize` and `reopened` run the check and report it. `closed` reports that the pull request was merged or closed, without scanning: when you list `closed`, keep `reopened` too, so a reopened pull request is checked again. `edited` runs the check; it is reported only when the base branch changed.
 - **What is sent**: the pull request's number, title, author, base branch and head commit; the equall-cli version, the `fail-on` threshold and the verdict; counts; and for each new finding its rule, WCAG criteria, severity, file, line and message. Never source code, HTML snippets or fix suggestions.
 - **Never changes the verdict**: the job passes or fails on the check alone. If the report cannot be delivered, the log says why. A repository not yet connected to Equall gets a notice, not a failure. Temporary errors are retried twice.
 - **Forks**: pull requests from forks get no identity token, so nothing is reported for them.

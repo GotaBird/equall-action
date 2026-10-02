@@ -111,14 +111,16 @@ runs:
           exit 0
         fi
         # Reporting: pin the exact version once, so the version reported is the one that ran.
-        EQUALL_ENGINE_VERSION=$(npx --yes "equall-cli@${EQUALL_VERSION}" --version)
+        EQUALL_ENGINE_VERSION=$(env -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN npx --yes "equall-cli@${EQUALL_VERSION}" --version)
         export EQUALL_ENGINE_VERSION
         result="${RUNNER_TEMP}/equall-result.json"
         rm -f "$result"
         set +e
         # ${BASE_INPUT:+...} expands to nothing when no base is given: a bare --diff then
         # compares against the pull request target branch, as above.
-        npx --yes "equall-cli@${EQUALL_ENGINE_VERSION}" scan "$SCAN_PATH" --level "$LEVEL" --diff ${BASE_INPUT:+"$BASE_INPUT"} --fail-on "$FAIL_ON" --json-out "$result"
+        # The scanner gets no way to request identity tokens: only report.mjs needs one.
+        env -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN \
+          npx --yes "equall-cli@${EQUALL_ENGINE_VERSION}" scan "$SCAN_PATH" --level "$LEVEL" --diff ${BASE_INPUT:+"$BASE_INPUT"} --fail-on "$FAIL_ON" --json-out "$result"
         code=$?
         set -e
         # 2 means the check could not run: there is no result to report.
