@@ -57,9 +57,11 @@ runs:
           action=$(node -e 'const e=require(process.env.GITHUB_EVENT_PATH); process.stdout.write(e.action==="edited" ? (e.changes && e.changes.base ? "retargeted" : "edited") : String(e.action||""))')
           case "$action" in
             closed) mode=closed ;;
+            # An edit still runs the gate: a skipped run on the same commit would replace a
+            # failing check with a green one. Only a change of base branch is reported.
             edited)
-              echo "::notice title=Equall::Only a change of base branch needs a new check: skipping."
-              mode=skip ;;
+              echo "::notice title=Equall::The pull request was edited without changing its base branch: checked, not reported."
+              report=false ;;
           esac
         fi
         echo "report=$report" >> "$GITHUB_OUTPUT"
@@ -114,6 +116,8 @@ runs:
         result="${RUNNER_TEMP}/equall-result.json"
         rm -f "$result"
         set +e
+        # ${BASE_INPUT:+...} expands to nothing when no base is given: a bare --diff then
+        # compares against the pull request target branch, as above.
         npx --yes "equall-cli@${EQUALL_ENGINE_VERSION}" scan "$SCAN_PATH" --level "$LEVEL" --diff ${BASE_INPUT:+"$BASE_INPUT"} --fail-on "$FAIL_ON" --json-out "$result"
         code=$?
         set -e

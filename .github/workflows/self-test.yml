@@ -22,7 +22,9 @@ jobs:
           path: test/fixture
 
   report:
-    # Same check, reported to a local stand-in for the Equall endpoint.
+    # Same check, reported to a local stand-in for the Equall endpoint. Pull requests from
+    # forks and Dependabot get no identity token, so nothing would be sent.
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     permissions:
       contents: read

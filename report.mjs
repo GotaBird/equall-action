@@ -92,7 +92,7 @@ export function buildClosed({ event, projectKey }) {
     project_key: projectKey,
     pr_number: pr.number,
     merged: pr.merged,
-    closed_at: pr.closed_at ?? new Date().toISOString(),
+    closed_at: pr.closed_at ?? pr.merged_at ?? new Date().toISOString(),
   }
 }
 
@@ -166,6 +166,8 @@ function report({ status, payload }) {
     notice(`Reported to Equall (${payload?.status ?? status}).`)
   } else if (status === 404) {
     notice('This repository is not connected to Equall, or the project key does not match: results were not uploaded.')
+  } else if (status === 409) {
+    notice('The pull request is already merged: this check was not recorded.')
   } else if (status === 403) {
     notice(`Equall did not accept this report: ${message}`)
   } else if (status === 0) {
@@ -206,7 +208,7 @@ async function main(argv, env) {
       projectKey,
     })
     envelope = built.envelope
-    if (built.dropped > 0) warning(`${built.dropped} finding(s) without a stable identity were not reported.`)
+    if (built.dropped > 0) warning(`${built.dropped} finding(s) without a stable identity are counted but not listed.`)
     if (envelope.findings.length > MAX_FINDINGS) {
       warning(`More than ${MAX_FINDINGS} new findings: too many to report. The check itself is unaffected.`)
       return
