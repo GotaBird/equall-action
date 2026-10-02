@@ -25,12 +25,48 @@ inputs:
   version:
     description: 'equall-cli version range to run.'
     required: false
-    default: '^0.3.2'
+    default: '^0.3.4'
+  report-to:
+    description: 'Equall ingest URL. When set with project-key, each pull request check is reported to Equall. Empty: nothing leaves the runner.'
+    required: false
+    default: ''
+  project-key:
+    description: "The project's key from its settings on Equall. Not a secret: pass it as a repository variable."
+    required: false
+    default: ''
 
 runs:
   using: 'composite'
   steps:
+    - name: Decide what to run
+      id: mode
+      shell: bash
+      env:
+        REPORT_TO: ${{ inputs.report-to }}
+        PROJECT_KEY: ${{ inputs.project-key }}
+      run: |
+        set -euo pipefail
+        report=false
+        if [ -n "$REPORT_TO" ] && [ -n "$PROJECT_KEY" ]; then
+          report=true
+        elif [ -n "$REPORT_TO" ] || [ -n "$PROJECT_KEY" ]; then
+          echo "::warning title=Equall::report-to and project-key must both be set to report to Equall. Nothing will be reported."
+        fi
+        mode=scan
+        if [ "$report" = "true" ] && [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
+          action=$(node -e 'const e=require(process.env.GITHUB_EVENT_PATH); process.stdout.write(e.action==="edited" ? (e.changes && e.changes.base ? "retargeted" : "edited") : String(e.action||""))')
+          case "$action" in
+            closed) mode=closed ;;
+            edited)
+              echo "::notice title=Equall::Only a change of base branch needs a new check: skipping."
+              mode=skip ;;
+          esac
+        fi
+        echo "report=$report" >> "$GITHUB_OUTPUT"
+        echo "mode=$mode" >> "$GITHUB_OUTPUT"
+
     - name: Fetch the history the comparison needs
+      if: steps.mode.outputs.mode == 'scan'
       shell: bash
       env:
         BASE_INPUT: ${{ inputs.base }}
@@ -47,6 +83,7 @@ runs:
         fi
 
     - name: Equall
+      if: steps.mode.outputs.mode == 'scan'
       shell: bash
       env:
         FAIL_ON: ${{ inputs.fail-on }}
@@ -54,13 +91,43 @@ runs:
         BASE_INPUT: ${{ inputs.base }}
         LEVEL: ${{ inputs.level }}
         EQUALL_VERSION: ${{ inputs.version }}
+        REPORT: ${{ steps.mode.outputs.report }}
+        EQUALL_REPORT_TO: ${{ inputs.report-to }}
+        EQUALL_PROJECT_KEY: ${{ inputs.project-key }}
+        ACTION_PATH: ${{ github.action_path }}
       run: |
         set -euo pipefail
-        if [ -n "$BASE_INPUT" ]; then
-          npx --yes "equall-cli@${EQUALL_VERSION}" scan "$SCAN_PATH" --level "$LEVEL" --diff "$BASE_INPUT" --fail-on "$FAIL_ON"
-        elif [ -n "${GITHUB_BASE_REF:-}" ]; then
-          npx --yes "equall-cli@${EQUALL_VERSION}" scan "$SCAN_PATH" --level "$LEVEL" --diff --fail-on "$FAIL_ON"
-        else
-          echo "::notice title=Equall::Not a pull request: running a report-only scan. The gate applies to pull requests."
-          npx --yes "equall-cli@${EQUALL_VERSION}" scan "$SCAN_PATH" --level "$LEVEL"
+        if [ "$REPORT" != "true" ] || [ "${GITHUB_EVENT_NAME:-}" != "pull_request" ]; then
+          if [ -n "$BASE_INPUT" ]; then
+            npx --yes "equall-cli@${EQUALL_VERSION}" scan "$SCAN_PATH" --level "$LEVEL" --diff "$BASE_INPUT" --fail-on "$FAIL_ON"
+          elif [ -n "${GITHUB_BASE_REF:-}" ]; then
+            npx --yes "equall-cli@${EQUALL_VERSION}" scan "$SCAN_PATH" --level "$LEVEL" --diff --fail-on "$FAIL_ON"
+          else
+            echo "::notice title=Equall::Not a pull request: running a report-only scan. The gate applies to pull requests."
+            npx --yes "equall-cli@${EQUALL_VERSION}" scan "$SCAN_PATH" --level "$LEVEL"
+          fi
+          exit 0
         fi
+        # Reporting: pin the exact version once, so the version reported is the one that ran.
+        EQUALL_ENGINE_VERSION=$(npx --yes "equall-cli@${EQUALL_VERSION}" --version)
+        export EQUALL_ENGINE_VERSION
+        result="${RUNNER_TEMP}/equall-result.json"
+        rm -f "$result"
+        set +e
+        npx --yes "equall-cli@${EQUALL_ENGINE_VERSION}" scan "$SCAN_PATH" --level "$LEVEL" --diff ${BASE_INPUT:+"$BASE_INPUT"} --fail-on "$FAIL_ON" --json-out "$result"
+        code=$?
+        set -e
+        # 2 means the check could not run: there is no result to report.
+        if [ "$code" -ne 2 ]; then
+          node "$ACTION_PATH/report.mjs" check "$result" "$code"
+        fi
+        exit "$code"
+
+    - name: Report the closed pull request
+      if: steps.mode.outputs.mode == 'closed'
+      shell: bash
+      env:
+        EQUALL_REPORT_TO: ${{ inputs.report-to }}
+        EQUALL_PROJECT_KEY: ${{ inputs.project-key }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: node "$ACTION_PATH/report.mjs" closed

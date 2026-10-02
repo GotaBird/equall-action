@@ -30,7 +30,9 @@ Each new finding is annotated on its file and line in the pull request.
 | `path` | `.` | Path to scan, relative to the repository root. |
 | `base` | the pull request target branch | Git ref to compare against. |
 | `level` | `AA` | WCAG conformance target: `A`, `AA` or `AAA`. |
-| `version` | `^0.3.2` | equall-cli version range to run. |
+| `version` | `^0.3.4` | equall-cli version range to run. |
+| `report-to` | empty | Equall ingest URL. With `project-key`, reports each check to Equall (see below). Empty: nothing leaves the runner. |
+| `project-key` | empty | The project's key from its settings on Equall. Not a secret: pass it as a repository variable. |
 
 ## What blocks, and what does not
 
@@ -48,6 +50,45 @@ A passing check means no new violation was found statically. Contrast, focus ord
 Outside a pull request (for example on `push`), the Action runs a report-only scan and never fails. Use the `pull_request` event: `pull_request_target` checks out the base branch, so there would be nothing to compare.
 
 Every finding is also listed in the job summary: GitHub shows at most ten annotations of each kind per step.
+
+## Report checks to Equall (optional)
+
+By default nothing leaves the runner. Set `report-to` and `project-key` to also send each pull request check to your project on Equall, so the team can see what each pull request introduced and what was fixed before merge.
+
+```yaml
+name: Accessibility
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, closed]
+
+concurrency:
+  group: equall-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  equall:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: GotaBird/equall-action@v1
+        with:
+          report-to: https://rptqzdxiynbsesndqjwh.supabase.co/functions/v1/ingest-ci
+          project-key: ${{ vars.EQUALL_PROJECT_KEY }}
+```
+
+- **Authentication**: `id-token: write` lets the Action request a short-lived GitHub identity token, which proves the report comes from this repository's own workflow. There is no secret to store. The token is never printed.
+- **Project key**: copy it from the project's settings on Equall into a repository variable named `EQUALL_PROJECT_KEY`. It routes the report to that project; on its own, without this repository's identity token, it is useless.
+- **Events**: `opened`, `synchronize` and `reopened` run the check and report it. `closed` reports that the pull request was merged or closed, without scanning. `edited` runs the check only when the base branch changed; other edits are skipped.
+- **What is sent**: the pull request's number, title, author, base branch and head commit; the equall-cli version, the `fail-on` threshold and the verdict; counts; and for each new finding its rule, WCAG criteria, severity, file, line and message. Never source code, HTML snippets or fix suggestions.
+- **Never changes the verdict**: the job passes or fails on the check alone. If the report cannot be delivered, the log says why. A repository not yet connected to Equall gets a notice, not a failure. Temporary errors are retried twice.
+- **Forks**: pull requests from forks get no identity token, so nothing is reported for them.
+- **Trust model**: Equall records what your workflow reports. It does not re-run the scan.
 
 ## Exit codes
 

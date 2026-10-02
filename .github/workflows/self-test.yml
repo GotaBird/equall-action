@@ -5,6 +5,12 @@ permissions:
   contents: read
 
 jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: node --test test/report.test.mjs
+
   equall:
     runs-on: ubuntu-latest
     steps:
@@ -14,3 +20,44 @@ jobs:
       - uses: ./
         with:
           path: test/fixture
+
+  report:
+    # Same check, reported to a local stand-in for the Equall endpoint.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Start the mock endpoint
+        run: |
+          node test/mock-endpoint.mjs 8787 "$RUNNER_TEMP/received.jsonl" &
+          sleep 1
+      - uses: ./
+        with:
+          path: test/fixture
+          report-to: http://127.0.0.1:8787/ingest
+          project-key: 00000000-0000-4000-8000-000000000000
+      - name: Check what was sent
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          node -e '
+            const fs = require("fs")
+            const lines = fs.readFileSync(process.env.RUNNER_TEMP + "/received.jsonl", "utf8").trim().split("\n")
+            if (lines.length !== 1) throw new Error("expected one request, got " + lines.length)
+            const { method, bearer, body } = JSON.parse(lines[0])
+            const ok = (c, m) => { if (!c) throw new Error(m) }
+            ok(method === "POST", "method")
+            ok(bearer, "an identity token was not sent")
+            ok(body.kind === "check" && body.payload_version === 1, "envelope kind")
+            ok(body.pr_number === Number(process.env.PR_NUMBER), "pr_number")
+            ok(body.head_sha === process.env.HEAD_SHA, "head_sha must be the pull request head")
+            ok(body.project_key === "00000000-0000-4000-8000-000000000000", "project_key")
+            ok(/^0\.3\.\d+/.test(body.engine_version), "engine_version")
+            ok(!/html_snippet|suggestion|help_url/.test(JSON.stringify(body)), "a finding leaked a disallowed field")
+            console.log("report OK:", body.findings.length, "finding(s)")
+          '
