@@ -7,7 +7,7 @@
 // Usage: node report.mjs check <result.json> <exit-code>
 //        node report.mjs closed
 
-import { readFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 
 export const AUDIENCE = 'https://equallscan.com'
@@ -107,6 +107,20 @@ export function isAllowedUrl(raw) {
   }
   if (u.protocol === 'https:') return true
   return u.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(u.hostname)
+}
+
+// The pull request page on Equall, as the ingest response gives it. It is put in a comment on
+// the pull request, so only an https link to Equall itself is accepted.
+export function isAllowedPullRequestUrl(raw) {
+  if (typeof raw !== 'string' || raw.length === 0 || raw.length > 2048) return false
+  let u
+  try {
+    u = new URL(raw)
+  } catch {
+    return false
+  }
+  if (u.protocol !== 'https:' || u.username !== '' || u.password !== '' || u.port !== '') return false
+  return u.hostname === 'equallscan.com' || u.hostname.endsWith('.equallscan.com')
 }
 
 export function classify(status) {
@@ -252,7 +266,21 @@ async function main(argv, env) {
     return
   }
   debugClaims(token)
-  report(await send({ url, token, body }))
+  const response = await send({ url, token, body })
+  report(response)
+  savePullRequestUrl(response, env.EQUALL_PR_URL_FILE)
+}
+
+// Hands the pull request page link to the comment step, when the response has a valid one.
+export function savePullRequestUrl({ status, payload }, path) {
+  if (!path || status < 200 || status >= 300) return false
+  const link = payload?.pull_request_url
+  if (!isAllowedPullRequestUrl(link)) {
+    if (link !== undefined && link !== null) debug('The response has a pull request link that is not an https Equall URL: not used.')
+    return false
+  }
+  writeFileSync(path, new URL(link).href)
+  return true
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {
