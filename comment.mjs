@@ -7,16 +7,21 @@
 //     only when the change introduces at least one new issue; once it exists, later runs keep
 //     it current, down to the state where nothing new is found.
 //
+// Every marker carries a scope (workflow, job, path and level), so several jobs commenting on
+// the same pull request each keep their own comments.
+//
 // Called by action.yml when `comment` is on. Like report.mjs, it is accessory: it always exits
 // 0 and speaks through workflow commands, so the check's own result never depends on it.
 //
 // Usage: node comment.mjs <result.json>
 
+import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 import { isAllowedUrl, isAllowedPullRequestUrl } from './report.mjs'
 
-export const SUMMARY_MARKER = '<!-- equall:pr-comment -->'
+export const SUMMARY_MARKER = '<!-- equall:pr-comment'
+export const DEFAULT_LOGIN = 'github-actions[bot]'
 export const SCHEMA = 'equall.pr-check/v1'
 export const MAX_INLINE = 10
 export const MAX_PAYLOAD_ISSUES = 50
@@ -25,6 +30,9 @@ const MAX_FILES_LISTED = 5
 const MAX_PAGES = 30
 const COMMENT_ACTIONS = ['opened', 'synchronize', 'reopened', 'ready_for_review']
 const SEVERITIES = ['critical', 'serious', 'moderate', 'minor']
+const SHA = /^[0-9a-f]{40}$/
+const FINGERPRINT = /^[A-Za-z0-9_-]{1,64}$/
+const CRITERION = /^\d\.\d{1,2}\.\d{1,2}$/
 
 // WCAG 2.2 success criteria, levels A and AA: the fallback "why it matters" line.
 export const WCAG_NAMES = {
@@ -62,23 +70,43 @@ export const WHO_IT_AFFECTS = {
   '4.1.3': 'Screen reader users are not told about this status change.',
 }
 
-// ---------------------------------------------------------------------------------------------
-// Rendering
 
-// Neutralize text that goes into Markdown: no HTML, no breaking out of a table cell.
-export function md(s) {
-  return String(s ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/\|/g, '\\|')
-    .replace(/[\r\n]+/g, ' ')
-    .trim()
+// ---------------------------------------------------------------------------------------------
+// Scope
+
+const normalizePath = (p) => {
+  const t = String(p ?? '').trim().replace(/^(\.\/)+/, '').replace(/\/+$/, '')
+  return t === '' ? '.' : t
 }
 
-// A code span: GitHub renders any HTML in it as text. The pipe is escaped for table cells.
-const code = (s) => `\`${String(s ?? '').replace(/[`\r\n]/g, '').replace(/\|/g, '\\|')}\``
+// A short id for one commenting job: two jobs on the same pull request (a monorepo `path`, a
+// matrix over `level`) never touch each other's comments.
+export function computeScope({ workflow, job, path, level }) {
+  const key = JSON.stringify([String(workflow ?? ''), String(job ?? ''), normalizePath(path), String(level ?? '')])
+  return createHash('sha256').update(key).digest('hex').slice(0, 8)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rendering
+//
+// Text from the engines (messages, fix hints, file paths, rule ids) is never trusted as
+// Markdown: a fix hint can quote attribute values written by the pull request's author. It is
+// always rendered inside a code span, where GitHub shows HTML, links, images and @mentions as
+// plain text. Only this file's own text and validated links are Markdown.
+
+// A code span around any text. The fence is longer than any backtick run inside it; in a
+// table cell, the pipe is escaped (GitHub honours `\|` inside code spans in tables).
+export function codeSpan(s, { table = false } = {}) {
+  let t = String(s ?? '').replace(/[\r\n]+/g, ' ').trim()
+  if (table) t = t.replace(/\|/g, '\\|')
+  const longest = Math.max(0, ...(t.match(/`+/g) ?? []).map((r) => r.length))
+  const fence = '`'.repeat(longest + 1)
+  const pad = t === '' || t.startsWith('`') || t.endsWith('`') ? ' ' : ''
+  return `${fence}${pad}${t}${pad}${fence}`
+}
+
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`
+const criteriaOf = (issue) => (Array.isArray(issue.wcag_criteria) ? issue.wcag_criteria.filter((c) => CRITERION.test(c)) : [])
 
 // The CLI appends the rule id to the message; the comment shows the rule on its own.
 export function plainMessage(issue) {
@@ -98,7 +126,7 @@ function safeLink(raw) {
 }
 
 export function whyItMatters(criteria) {
-  const list = Array.isArray(criteria) ? criteria : []
+  const list = (Array.isArray(criteria) ? criteria : []).filter((c) => CRITERION.test(c))
   for (const c of list) if (WHO_IT_AFFECTS[c]) return WHO_IT_AFFECTS[c]
   const named = list.map((c) => (WCAG_NAMES[c] ? `${c} ${WCAG_NAMES[c]}` : c))
   return named.length > 0 ? `It fails WCAG ${named.join(', ')}.` : null
@@ -109,27 +137,28 @@ export function howToFix(issue) {
   const hint = typeof issue.suggestion === 'string' ? issue.suggestion.trim() : ''
   if (hint !== '' && hint !== 'Auto-fixable') {
     const [lead, ...rest] = hint.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
-    const bullets = rest.slice(0, 4).map((l) => `- ${md(l)}`)
+    const bullets = rest.slice(0, 4).map((l) => `- ${codeSpan(l)}`)
     if (rest.length > 4) bullets.push('- …')
-    return [`**How to fix:** ${md(lead)}`, ...bullets].join('\n')
+    return [`**How to fix:** ${codeSpan(lead)}`, ...bullets].join('\n')
   }
   const link = safeLink(issue.help_url)
   return link ? `**How to fix:** see the [rule's guidance](${link}).` : null
 }
 
-const inlineMarker = (fp, state) => `<!-- equall:inline fp=${fp}${state === 'resolved' ? ' state=resolved' : ''} -->`
+export const summaryMarker = (scope) => `${SUMMARY_MARKER} scope=${scope} -->`
+const inlineMarker = (scope, fp, resolved = false) => `<!-- equall:inline scope=${scope} fp=${fp}${resolved ? ' state=resolved' : ''} -->`
 
-export function renderInline(issue) {
-  const criteria = (issue.wcag_criteria ?? []).map((c) => (WCAG_NAMES[c] ? `WCAG ${c} ${WCAG_NAMES[c]}` : `WCAG ${c}`))
+export function renderInline(issue, scope) {
+  const criteria = criteriaOf(issue).map((c) => (WCAG_NAMES[c] ? `WCAG ${c} ${WCAG_NAMES[c]}` : `WCAG ${c}`))
   return [
-    inlineMarker(issue.fingerprint),
-    `**${md(plainMessage(issue))}**`,
+    inlineMarker(scope, issue.fingerprint),
+    `**New issue:** ${codeSpan(plainMessage(issue))}`,
     '',
     whyItMatters(issue.wcag_criteria),
     '',
     howToFix(issue),
     '',
-    `<sub>Equall · new in this pull request · ${code(issue.scanner_rule_id)}${criteria.length ? ` · ${md(criteria.join(', '))}` : ''}</sub>`,
+    `<sub>Equall · new in this pull request · ${codeSpan(issue.scanner_rule_id)}${criteria.length ? ` · ${criteria.join(', ')}` : ''}</sub>`,
   ]
     .filter((l) => l !== null)
     .join('\n')
@@ -137,11 +166,11 @@ export function renderInline(issue) {
 }
 
 // An inline comment whose issue the latest check no longer finds: kept, marked, never deleted.
-export function renderInlineResolved(previousBody, fp, headSha) {
-  const original = previousBody.replace(/^<!-- equall:inline[^>]*-->\n?/, '')
+export function renderInlineResolved(previousBody, scope, fp, sha) {
+  const original = String(previousBody).replace(/^<!-- equall:inline[^>]*-->\n?/, '')
   return [
-    inlineMarker(fp, 'resolved'),
-    `No longer found by the check on ${code(String(headSha).slice(0, 7))}.`,
+    inlineMarker(scope, fp, true),
+    `No longer found by the check on ${codeSpan(String(sha).slice(0, 7))}.`,
     '',
     '<details><summary>Previous comment</summary>',
     '',
@@ -151,18 +180,18 @@ export function renderInlineResolved(previousBody, fp, headSha) {
   ].join('\n')
 }
 
-// Parses an Equall inline comment marker: { fp, resolved } or null.
+// Parses an Equall inline comment marker: { scope, fp, resolved } or null.
 export function parseInlineMarker(body) {
-  const m = /^<!-- equall:inline fp=([A-Za-z0-9_-]+)( state=resolved)? -->/.exec(String(body ?? ''))
-  return m ? { fp: m[1], resolved: Boolean(m[2]) } : null
+  const m = /^<!-- equall:inline scope=([0-9a-f]{8}) fp=([A-Za-z0-9_-]{1,64})( state=resolved)? -->/.exec(String(body ?? ''))
+  return m ? { scope: m[1], fp: m[2], resolved: Boolean(m[3]) } : null
 }
 
 function fileList(files) {
-  const shown = files.slice(0, MAX_FILES_LISTED).map(code).join(', ')
+  const shown = files.slice(0, MAX_FILES_LISTED).map((f) => codeSpan(f)).join(', ')
   return files.length > MAX_FILES_LISTED ? `${shown} and ${files.length - MAX_FILES_LISTED} more` : shown
 }
 
-// The JSON goes inside an HTML comment: `<` and `>` are escaped so it can never close it.
+// The JSON goes inside an HTML comment: `<`, `>` and `&` are escaped so it can never close it.
 export function encodeData(data) {
   return JSON.stringify(data).replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026')
 }
@@ -201,26 +230,30 @@ export function buildPayload({ result, repository, pullNumber, headSha, engineVe
       wcag: Array.isArray(i.wcag_criteria) ? i.wcag_criteria : [],
       severity: SEVERITIES.includes(i.severity) ? i.severity : null,
     })),
+    truncated: result.new_issues.length > MAX_PAYLOAD_ISSUES,
   }
 }
 
-// `listed`: the new issues not already shown inline. `pullRequestUrl`: validated, or null.
-export function renderSummary({ result, payload, listed, pullRequestUrl }) {
+// `listed`: the new issues not shown inline. `pullRequestUrl`: validated, or null.
+// `fixedAtLeast`: the previous list was cut, so the fixed count is a lower bound.
+export function renderSummary({ result, payload, listed, pullRequestUrl, scope, scanPath = '.', fixedAtLeast = false }) {
   const n = payload.counts.new
   const fixed = payload.counts.fixed
-  const fixedText = fixed > 0 ? ` ${plural(fixed, 'issue', 'issues')} fixed since the last check.` : ''
-  const lines = [SUMMARY_MARKER, '### Equall', '']
+  const fixedText = fixed > 0 ? ` ${fixedAtLeast ? 'At least ' : ''}${plural(fixed, 'issue', 'issues')} fixed since the last check.` : ''
+  const path = normalizePath(scanPath)
+  const lines = [summaryMarker(scope), `### Equall${path !== '.' ? ` · ${codeSpan(path)}` : ''}`, '']
   if (n > 0) {
     lines.push(`Equall found ${plural(n, 'new accessibility issue', 'new accessibility issues')} in this pull request.${fixedText}`)
+    const inline = n - listed.length
+    if (inline > 0) lines.push('', `${inline} of them ${inline === 1 ? 'is' : 'are'} commented on the changed lines.`)
   } else {
     lines.push(`No new accessibility issue found by static checks in this pull request.${fixedText}`)
   }
-  if (n > 0) lines.push('', n - listed.length > 0 ? `${n - listed.length} of them ${n - listed.length === 1 ? 'is' : 'are'} commented on the changed lines.` : '')
 
   if (listed.length > 0) {
     const rows = listed.slice(0, MAX_LISTED).map((i) => {
       const where = Number.isInteger(i.line) && i.line > 0 ? `${i.file_path}:${i.line}` : i.file_path
-      return `| ${code(where)} | ${md(plainMessage(i))} (${code(i.scanner_rule_id)}) | ${md((i.wcag_criteria ?? []).join(', '))} |`
+      return `| ${codeSpan(where, { table: true })} | ${codeSpan(plainMessage(i), { table: true })} ${codeSpan(i.scanner_rule_id, { table: true })} | ${criteriaOf(i).join(', ')} |`
     })
     if (listed.length > MAX_LISTED) rows.push(`| … | ${listed.length - MAX_LISTED} more in the job summary | |`)
     lines.push(
@@ -253,8 +286,8 @@ export function renderSummary({ result, payload, listed, pullRequestUrl }) {
   if (pullRequestUrl) lines.push('', `[View on Equall](${pullRequestUrl})`)
   lines.push(
     '',
-    `<sub>Checked commit ${code(String(payload.head_sha).slice(0, 7))}. Static checks only: contrast, focus order and other rendered checks need their own test. ` +
-      'For agents: the data block in this comment lists the new issues of this check; the Equall MCP tool `get_pull_request_check` returns the same data.</sub>',
+    `<sub>Checked commit ${codeSpan(String(payload.head_sha).slice(0, 7))}. Static checks only: contrast, focus order and other rendered checks need their own test. ` +
+      `For agents: the data block in this comment lists the new issues of this check (schema ${SCHEMA}).</sub>`,
     '',
     `<!-- equall:data ${encodeData(payload)} -->`,
   )
@@ -264,8 +297,10 @@ export function renderSummary({ result, payload, listed, pullRequestUrl }) {
 // ---------------------------------------------------------------------------------------------
 // Diff mapping
 
-// Lines of the new file (RIGHT side) a review comment can be attached to: added and context
-// lines inside the hunks of a unified patch, as the pull request files API returns it.
+// Lines of the new file (RIGHT side) a review comment can be attached to: added (`+`) and
+// context (` `) lines inside the hunks of a unified patch, as the pull request files API
+// returns it. Anything else (removed lines, `\ No newline at end of file`, a trailing empty
+// line) is not a line of the new file.
 export function commentableLines(patch) {
   const lines = new Set()
   if (typeof patch !== 'string') return lines
@@ -278,7 +313,7 @@ export function commentableLines(patch) {
       inHunk = true
       continue
     }
-    if (!inHunk || raw.startsWith('-') || raw.startsWith('\\')) continue
+    if (!inHunk || !(raw.startsWith('+') || raw.startsWith(' '))) continue
     lines.add(right)
     right++
   }
@@ -289,9 +324,10 @@ export function commentableLines(patch) {
 // GitHub API
 
 export class ApiError extends Error {
-  constructor(status, message) {
+  constructor(status, message, context = '') {
     super(message)
     this.status = status
+    this.context = context
   }
 }
 
@@ -305,15 +341,22 @@ export function createClient({ apiUrl, token, repository, fetchImpl = fetch }) {
     'Content-Type': 'application/json',
     'User-Agent': 'equall-action',
   }
-  async function call(method, pathOrUrl, body) {
-    const url = pathOrUrl.startsWith('http') ? pathOrUrl : `${base}/repos/${repository}${pathOrUrl}`
-    // The token only goes back to the API it came from.
-    if (new URL(url).origin !== origin) throw new ApiError(0, 'refusing to follow a link outside the API')
-    const res = await fetchImpl(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) })
+  async function request(method, url, body, context) {
+    // The token only goes back to the API it came from, and never follows a redirect.
+    if (new URL(url).origin !== origin) throw new ApiError(0, 'refusing to follow a link outside the API', context)
+    let res
+    try {
+      res = await fetchImpl(url, { method, headers, redirect: 'error', body: body === undefined ? undefined : JSON.stringify(body) })
+    } catch (err) {
+      throw new ApiError(0, err instanceof Error ? err.message : String(err), context)
+    }
     const data = await res.json().catch(() => null)
-    if (res.status < 200 || res.status >= 300) throw new ApiError(res.status, data?.message ?? `HTTP ${res.status}`)
+    if (res.status < 200 || res.status >= 300) throw new ApiError(res.status, data?.message ?? `HTTP ${res.status}`, context)
     return { data, link: res.headers?.get?.('link') ?? null }
   }
+  // Paths are relative to the repository; absolute URLs only come from pagination links.
+  const call = (method, pathOrUrl, body) =>
+    request(method, pathOrUrl.startsWith('http') ? pathOrUrl : `${base}/repos/${repository}${pathOrUrl}`, body, `${method} ${pathOrUrl.split('?')[0]}`)
   async function paginate(path) {
     const items = []
     let next = `${path}${path.includes('?') ? '&' : '?'}per_page=100`
@@ -324,29 +367,84 @@ export function createClient({ apiUrl, token, repository, fetchImpl = fetch }) {
     }
     return items
   }
-  return { call, paginate }
+  // The token's own login, when the API tells it (a personal token). The workflow token
+  // cannot read /user: null, and the caller falls back to the Actions bot.
+  async function whoami() {
+    try {
+      const { data } = await request('GET', `${base}/user`, undefined, 'GET /user')
+      return typeof data?.login === 'string' ? data.login : null
+    } catch {
+      return null
+    }
+  }
+  return { call, paginate, whoami }
 }
 
-// Only comments a bot wrote count as Equall's: a marker pasted by a person is ignored.
-const byBot = (c) => c?.user?.type === 'Bot'
+// Writes are independent: one refused write is logged and the others still run. A 401 or 403
+// on the very first write means the token cannot write at all: that one stops the run.
+function createWriter(client, log) {
+  let first = true
+  return async function write(what, method, path, body, { quiet = false } = {}) {
+    const isFirst = first
+    first = false
+    try {
+      return { ok: true, data: (await client.call(method, path, body)).data }
+    } catch (err) {
+      if (isFirst && (err.status === 401 || err.status === 403)) {
+        err.permission = true
+        throw err
+      }
+      if (!quiet) log.warning(`Could not ${what} (${err.status ? `HTTP ${err.status}: ` : ''}${err.message}). The check itself is unaffected.`)
+      return { ok: false, err }
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------------------------
 // Orchestration
+
+const isDependabot = (login) => login === 'dependabot[bot]'
 
 // Why commenting is skipped, or null. `kind` picks the workflow command.
 export function skipReason({ eventName, event, actor }) {
   if (eventName !== 'pull_request') return { kind: 'debug', message: `Not a pull_request event (${eventName}): no comment.` }
   if (!COMMENT_ACTIONS.includes(event.action)) return { kind: 'debug', message: `Pull request ${event.action}: no comment.` }
   const pr = event.pull_request
-  if (!pr || !Number.isInteger(pr.number)) return { kind: 'debug', message: 'No pull request in the event: no comment.' }
-  if (pr.head?.repo?.full_name && pr.head.repo.full_name !== event.repository?.full_name) {
+  if (!pr || !Number.isInteger(pr.number) || !SHA.test(pr.head?.sha ?? '')) return { kind: 'debug', message: 'No pull request in the event: no comment.' }
+  // A deleted fork has no head repository left: still a fork.
+  if (!pr.head.repo || pr.head.repo.full_name !== event.repository?.full_name) {
     return { kind: 'notice', message: 'Pull request from a fork: its token cannot comment, so the results are in the job summary only.' }
   }
-  if (actor === 'dependabot[bot]') return { kind: 'notice', message: 'Dependabot pull requests get a read-only token: no comment.' }
+  if (isDependabot(actor) || isDependabot(pr.user?.login)) return { kind: 'notice', message: 'Dependabot pull requests get a read-only token: no comment.' }
   return null
 }
 
-export async function run({ result, event, eventName, actor, client, engineVersion, pullRequestUrl, log }) {
+// Issues the previous check listed that this one no longer finds. A re-run on the same commit
+// keeps the previous count; a file that could not be analysed this time is not counted as
+// fixed. When the previous list was cut at its limit, the count is a lower bound.
+export function countFixed({ previous, previousBody = '', sha, current, unchecked }) {
+  if (!previous) return { fixed: 0, atLeast: false }
+  if (previous.head_sha === sha) {
+    const fixed = Number.isInteger(previous.counts?.fixed) ? previous.counts.fixed : 0
+    return { fixed, atLeast: fixed > 0 && /At least \d+ issues? fixed/.test(previousBody) }
+  }
+  const gone = (previous.new_issues ?? []).filter((i) => i.fingerprint && !current.has(i.fingerprint) && !unchecked.has(i.file))
+  return { fixed: gone.length, atLeast: previous.truncated === true }
+}
+
+// Equall's live inline comments of this scope, by fingerprint. An outdated comment (its line
+// is gone after a push) no longer shows the issue: it counts as absent.
+function inlineByFingerprint(comments, ours, scope) {
+  const map = new Map()
+  for (const c of comments) {
+    if (!ours(c) || c.line === null || c.line === undefined) continue
+    const marker = parseInlineMarker(c.body)
+    if (marker && marker.scope === scope && !map.has(marker.fp)) map.set(marker.fp, { ...marker, comment: c })
+  }
+  return map
+}
+
+export async function run({ result, event, eventName, actor, client, engineVersion, pullRequestUrl, log, scope, scanPath = '.' }) {
   const skip = skipReason({ eventName, event, actor })
   if (skip) {
     log[skip.kind](skip.message)
@@ -354,100 +452,110 @@ export async function run({ result, event, eventName, actor, client, engineVersi
   }
   const pr = event.pull_request
   const n = pr.number
-  const headSha = pr.head.sha
+  const eventHead = pr.head.sha
   const repository = event.repository.full_name
+  // The commit the engine scanned. Inline comments need its line numbers to be the pull request
+  // head's, so they are posted only when it is the head itself (not a merge commit).
+  const scanned = SHA.test(result.head ?? '') ? result.head : eventHead
+  const inlineAllowed = scanned === eventHead
+  if (!inlineAllowed) {
+    log.notice('The scanned commit is not the pull request head (a merge commit?): issues are listed in the summary, not inline. Check out github.event.pull_request.head.sha for inline comments.')
+  }
+
+  const own = await client.whoami()
+  const logins = new Set([DEFAULT_LOGIN, ...(own ? [own] : [])])
+  const ours = (c) => logins.has(c?.user?.login)
+  const write = createWriter(client, log)
 
   // 1. Where an inline comment can go: the RIGHT side lines of each file's patch.
   const files = await client.paginate(`/pulls/${n}/files`)
   const commentable = new Map(files.map((f) => [f.filename, commentableLines(f.patch)]))
 
-  // 2. Equall's inline comments already on the pull request, by fingerprint.
-  const reviewComments = (await client.paginate(`/pulls/${n}/comments`)).filter(byBot)
-  const existingInline = new Map()
-  for (const c of reviewComments) {
-    const marker = parseInlineMarker(c.body)
-    if (marker && !existingInline.has(marker.fp)) existingInline.set(marker.fp, { ...marker, comment: c })
+  // 2. Equall's live inline comments of this scope, by fingerprint.
+  let existingInline = inlineByFingerprint(await client.paginate(`/pulls/${n}/comments`), ours, scope)
+
+  // 3. The summary of this scope, if any.
+  const issueComments = await client.paginate(`/issues/${n}/comments`)
+  const summary = issueComments.find((c) => ours(c) && String(c.body ?? '').startsWith(summaryMarker(scope)))
+  const newIssues = result.new_issues ?? []
+  if (!summary && newIssues.length === 0 && existingInline.size === 0) {
+    log.debug('Nothing new found and no previous comment: no comment.')
+    return { skipped: false, posted: 0, marked: 0, summary: 'none' }
   }
 
-  // 3. New issues: already commented, to comment now, or to list in the summary.
-  const newIssues = result.new_issues ?? []
+  // 4. A check that is no longer about the pull request's head writes nothing: a newer run
+  //    will comment on the newer commit.
+  const { data: live } = await client.call('GET', `/pulls/${n}`)
+  if (live?.state !== 'open' || live?.head?.sha !== eventHead) {
+    log.notice('The pull request changed since this check started: no comment. The run on its latest commit comments.')
+    return { skipped: true }
+  }
+
+  // 5. New issues: already commented, to comment now, or to list in the summary.
   const current = new Set(newIssues.map((i) => i.fingerprint).filter(Boolean))
   const toPost = []
   const listed = []
   for (const issue of newIssues) {
     const fp = issue.fingerprint
-    if (fp && existingInline.has(fp)) {
-      const prev = existingInline.get(fp)
+    const prev = fp ? existingInline.get(fp) : undefined
+    if (prev) {
       // Back after being marked as no longer found: restore the comment.
-      if (prev.resolved) await client.call('PATCH', `/pulls/comments/${prev.comment.id}`, { body: renderInline(issue) })
+      if (prev.resolved) await write('restore an inline comment', 'PATCH', `/pulls/comments/${prev.comment.id}`, { body: renderInline(issue, scope) })
       continue
     }
-    const onDiff = fp && Number.isInteger(issue.line) && commentable.get(issue.file_path)?.has(issue.line)
+    const onDiff = inlineAllowed && FINGERPRINT.test(fp ?? '') && Number.isInteger(issue.line) && commentable.get(issue.file_path)?.has(issue.line)
     if (onDiff && toPost.length < MAX_INLINE) toPost.push(issue)
     else listed.push(issue)
   }
 
-  // 4. Post the inline comments as one review (one notification). If GitHub refuses the batch,
-  //    fall back to one by one; whatever still fails goes to the summary list.
+  // 6. The inline comments, as one review (one notification). If the review fails, it may
+  //    still have been created (a timeout, a 5xx): list the comments again, then post the
+  //    missing ones one by one. Whatever still fails goes to the summary list.
   let posted = 0
   if (toPost.length > 0) {
-    const comments = toPost.map((i) => ({ path: i.file_path, line: i.line, side: 'RIGHT', body: renderInline(i) }))
-    try {
-      await client.call('POST', `/pulls/${n}/reviews`, { commit_id: headSha, event: 'COMMENT', comments })
+    const comment = (i) => ({ path: i.file_path, line: i.line, side: 'RIGHT', body: renderInline(i, scope) })
+    const review = await write('post the review', 'POST', `/pulls/${n}/reviews`, { commit_id: eventHead, event: 'COMMENT', comments: toPost.map(comment) }, { quiet: true })
+    if (review.ok) {
       posted = toPost.length
-    } catch (err) {
-      if (err.status === 403) throw err
-      for (const [k, issue] of toPost.entries()) {
-        try {
-          await client.call('POST', `/pulls/${n}/comments`, { commit_id: headSha, ...comments[k] })
+    } else {
+      existingInline = inlineByFingerprint(await client.paginate(`/pulls/${n}/comments`), ours, scope)
+      for (const issue of toPost) {
+        if (existingInline.has(issue.fingerprint)) {
           posted++
-        } catch (inner) {
-          if (inner.status === 403) throw inner
-          listed.push(issue)
+          continue
         }
+        const single = await write(`comment on ${issue.file_path}:${issue.line}`, 'POST', `/pulls/${n}/comments`, { commit_id: eventHead, ...comment(issue) })
+        if (single.ok) posted++
+        else listed.push(issue)
       }
     }
   }
 
-  // 5. Inline comments whose issue is gone: marked, not deleted. A file the scanner could not
+  // 7. Inline comments whose issue is gone: marked, not deleted. A file the scanner could not
   //    analyse this time says nothing about its issues, so its comments are left as they are.
   const unchecked = new Set((result.unchecked ?? []).map((u) => u.file_path))
   let marked = 0
   for (const [fp, prev] of existingInline) {
     if (current.has(fp) || prev.resolved || unchecked.has(prev.comment.path)) continue
-    await client.call('PATCH', `/pulls/comments/${prev.comment.id}`, { body: renderInlineResolved(prev.comment.body, fp, headSha) })
-    marked++
+    const res = await write('mark an inline comment as no longer found', 'PATCH', `/pulls/comments/${prev.comment.id}`, { body: renderInlineResolved(prev.comment.body, scope, fp, scanned) })
+    if (res.ok) marked++
   }
 
-  // 6. The summary: found again by its marker; created only when something new was found.
-  const issueComments = (await client.paginate(`/issues/${n}/comments`)).filter(byBot)
-  const summary = issueComments.find((c) => String(c.body ?? '').startsWith(SUMMARY_MARKER))
-  if (!summary && newIssues.length === 0) {
-    log.debug('Nothing new found and no previous summary: no comment.')
-    return { skipped: false, posted, marked, summary: 'none' }
-  }
+  // 8. The summary: created only when something new was found, then kept current.
+  if (!summary && newIssues.length === 0) return { skipped: false, posted, marked, summary: 'none' }
   const previous = summary ? parseData(summary.body) : null
-  const fixed = countFixed({ previous, headSha, current, unchecked })
-  const payload = buildPayload({ result, repository, pullNumber: n, headSha, engineVersion, fixed })
-  const body = renderSummary({ result, payload, listed, pullRequestUrl })
+  const { fixed, atLeast } = countFixed({ previous, previousBody: summary?.body, sha: scanned, current, unchecked })
+  const payload = buildPayload({ result, repository, pullNumber: n, headSha: scanned, engineVersion, fixed })
+  const body = renderSummary({ result, payload, listed, pullRequestUrl, scope, scanPath, fixedAtLeast: atLeast })
   if (!summary) {
-    await client.call('POST', `/issues/${n}/comments`, { body })
-    return { skipped: false, posted, marked, summary: 'created' }
+    const res = await write('post the summary comment', 'POST', `/issues/${n}/comments`, { body })
+    return { skipped: false, posted, marked, summary: res.ok ? 'created' : 'failed' }
   }
   if (summary.body !== body) {
-    await client.call('PATCH', `/issues/comments/${summary.id}`, { body })
-    return { skipped: false, posted, marked, summary: 'updated' }
+    const res = await write('update the summary comment', 'PATCH', `/issues/comments/${summary.id}`, { body })
+    return { skipped: false, posted, marked, summary: res.ok ? 'updated' : 'failed' }
   }
   return { skipped: false, posted, marked, summary: 'unchanged' }
-}
-
-// Issues the previous check listed that this one no longer finds. A re-run on the same commit
-// keeps the previous count; a file that could not be analysed this time is not counted as fixed.
-export function countFixed({ previous, headSha, current, unchecked }) {
-  if (!previous) return 0
-  if (previous.head_sha === headSha) return Number.isInteger(previous.counts?.fixed) ? previous.counts.fixed : 0
-  const gone = (previous.new_issues ?? []).filter((i) => i.fingerprint && !current.has(i.fingerprint) && !unchecked.has(i.file))
-  return gone.length
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -463,10 +571,11 @@ const log = {
 }
 
 export function describeFailure(err) {
-  if (err?.status === 403 || err?.status === 401) {
+  if (err?.permission) {
     return { kind: 'warning', message: 'The workflow token cannot comment on this pull request: add `permissions: pull-requests: write` to the workflow. The check itself is unaffected.' }
   }
-  return { kind: 'warning', message: `Could not comment on the pull request: ${err?.message ?? String(err)}. The check itself is unaffected.` }
+  const where = err?.context ? ` (${err.context}${err.status ? `, HTTP ${err.status}` : ''})` : ''
+  return { kind: 'warning', message: `Could not comment on the pull request${where}: ${err?.message ?? String(err)}. The check itself is unaffected.` }
 }
 
 function readPullRequestUrl(path) {
@@ -500,6 +609,8 @@ async function main(argv, env) {
   }
   const event = JSON.parse(readFileSync(env.GITHUB_EVENT_PATH, 'utf8'))
   const client = createClient({ apiUrl, token, repository: event.repository?.full_name ?? env.GITHUB_REPOSITORY })
+  const scanPath = env.EQUALL_SCAN_PATH || '.'
+  const scope = computeScope({ workflow: env.GITHUB_WORKFLOW, job: env.GITHUB_JOB, path: scanPath, level: env.EQUALL_LEVEL })
   try {
     const out = await run({
       result,
@@ -510,15 +621,17 @@ async function main(argv, env) {
       engineVersion: env.EQUALL_ENGINE_VERSION,
       pullRequestUrl: readPullRequestUrl(env.EQUALL_PR_URL_FILE),
       log,
+      scope,
+      scanPath,
     })
-    if (!out.skipped) log.debug(`inline posted=${out.posted} marked=${out.marked} summary=${out.summary}`)
+    if (!out.skipped) log.debug(`scope=${scope} inline posted=${out.posted} marked=${out.marked} summary=${out.summary}`)
   } catch (err) {
     const { kind, message } = describeFailure(err)
     log[kind](message)
   }
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main(process.argv.slice(2), process.env).catch((err) => {
     log.warning(`Commenting failed: ${err instanceof Error ? err.message : String(err)}. The check itself is unaffected.`)
   })

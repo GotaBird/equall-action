@@ -1,11 +1,22 @@
 // Stand-in for the GitHub REST API in the comment tests: just the routes comment.mjs uses,
-// with pagination through Link headers and an optional forced status.
+// with pagination through Link headers and injectable failures:
+//   forceStatus       every request answers this status
+//   forceWriteStatus  every POST or PATCH answers this status
+//   failures          [{ method, match: RegExp, status, times }] for the matching requests
+//   reviewThenFail    a review is created, then answered with this status (a timeout, a 5xx)
 import { createServer } from 'node:http'
 
-export function startMockGitHub({ repository = 'acme/site', pull = 42, files = [], pageSize = 100, forceStatus = null } = {}) {
-  const state = { files, reviewComments: [], issueComments: [], requests: [], nextId: 1000, forceStatus }
+export function startMockGitHub({
+  repository = 'acme/site', pull = 42, files = [], pageSize = 100, head = 'a'.repeat(40),
+  forceStatus = null, forceWriteStatus = null, failures = [], reviewThenFail = null, userLogin = null,
+  botLogin = 'github-actions[bot]',
+} = {}) {
+  const state = {
+    files, reviewComments: [], issueComments: [], requests: [], nextId: 1000,
+    forceStatus, forceWriteStatus, failures, reviewThenFail, userLogin, prHead: head, prState: 'open',
+  }
   const prefix = `/repos/${repository}`
-  const bot = { login: 'github-actions[bot]', type: 'Bot' }
+  const bot = { login: botLogin, type: 'Bot' }
 
   const server = createServer((req, res) => {
     let raw = ''
@@ -19,6 +30,13 @@ export function startMockGitHub({ repository = 'acme/site', pull = 42, files = [
         res.end(JSON.stringify(data))
       }
       if (state.forceStatus) return send(state.forceStatus, { message: 'Resource not accessible by integration' })
+      const isWrite = req.method === 'POST' || req.method === 'PATCH'
+      if (isWrite && state.forceWriteStatus) return send(state.forceWriteStatus, { message: 'Resource not accessible by integration' })
+      const failure = state.failures.find((f) => f.method === req.method && f.match.test(url.pathname) && (f.times ?? 1) > 0)
+      if (failure) {
+        failure.times = (failure.times ?? 1) - 1
+        return send(failure.status, { message: 'Injected failure' })
+      }
 
       const list = (items) => {
         const page = Number(url.searchParams.get('page') || 1)
@@ -36,11 +54,16 @@ export function startMockGitHub({ repository = 'acme/site', pull = 42, files = [
       const p = url.pathname
       const m = (re) => re.exec(p)
       let r
+      if (req.method === 'GET' && p === '/user') {
+        return state.userLogin ? send(200, { login: state.userLogin }) : send(403, { message: 'Resource not accessible by integration' })
+      }
+      if (req.method === 'GET' && p === `${prefix}/pulls/${pull}`) return send(200, { number: pull, state: state.prState, head: { sha: state.prHead } })
       if (req.method === 'GET' && p === `${prefix}/pulls/${pull}/files`) return list(state.files)
       if (req.method === 'GET' && p === `${prefix}/pulls/${pull}/comments`) return list(state.reviewComments)
       if (req.method === 'GET' && p === `${prefix}/issues/${pull}/comments`) return list(state.issueComments)
       if (req.method === 'POST' && p === `${prefix}/pulls/${pull}/reviews`) {
         for (const c of body.comments) state.reviewComments.push({ id: state.nextId++, user: bot, commit_id: body.commit_id, ...c })
+        if (state.reviewThenFail) return send(state.reviewThenFail, { message: 'Server Error' })
         return send(200, { id: state.nextId++ })
       }
       if (req.method === 'POST' && p === `${prefix}/pulls/${pull}/comments`) {

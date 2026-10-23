@@ -149,13 +149,16 @@ runs:
         fi
         exit "$code"
 
-    # Runs after the gate, even when it fails, and never changes the job's result.
+    # Runs after the gate, also when it fails (not when the run is cancelled), and never changes
+    # the job's result. Path and level, with the workflow and job, scope the comments.
     - name: Comment on the pull request
-      if: always() && steps.mode.outputs.comment == 'true' && steps.scan.outcome != 'skipped'
+      if: ${{ !cancelled() && steps.mode.outputs.comment == 'true' && steps.scan.outcome != 'skipped' }}
       continue-on-error: true
       shell: bash
       env:
         EQUALL_GITHUB_TOKEN: ${{ github.token }}
+        EQUALL_SCAN_PATH: ${{ inputs.path }}
+        EQUALL_LEVEL: ${{ inputs.level }}
         ACTION_PATH: ${{ github.action_path }}
       run: |
         result="${RUNNER_TEMP}/equall-result.json"
