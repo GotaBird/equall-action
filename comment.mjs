@@ -54,20 +54,22 @@ export const WCAG_NAMES = {
 
 // Who is affected, for the criteria static checks report most often. One sentence each.
 export const WHO_IT_AFFECTS = {
-  '1.1.1': 'People using a screen reader get no description of this content, or only its file name.',
-  '1.3.1': 'Screen reader users lose the structure sighted users see, such as which label goes with which field.',
-  '1.4.3': 'People with low vision may not be able to read text that does not stand out from its background.',
-  '2.1.1': 'People who use a keyboard or a switch device cannot reach or operate this control.',
-  '2.4.1': 'Keyboard and screen reader users have to go through repeated content before reaching the main content.',
-  '2.4.2': 'Screen reader users and anyone switching tabs cannot tell what this page is about.',
-  '2.4.4': 'Screen reader users who browse a list of links cannot tell where this link goes.',
-  '2.4.6': 'People navigating by headings or labels cannot tell sections or fields apart.',
-  '2.5.3': 'Voice control users cannot activate this control by saying the label they see.',
-  '3.1.1': 'Screen readers may pronounce this page with the wrong language rules.',
-  '3.3.1': 'People who cannot see the error styling are not told that, or why, a field is invalid.',
-  '3.3.2': 'People using a screen reader or voice control cannot tell what this field expects.',
-  '4.1.2': 'Assistive technologies cannot announce what this element is or what it does.',
-  '4.1.3': 'Screen reader users are not told about this status change.',
+  '1.1.1': 'People using a screen reader may get no description of this content, or only its file name.',
+  '1.3.1': 'Screen reader users may miss the structure sighted users see, such as which label goes with which field.',
+  '1.4.3': 'People with low vision may not be able to read this text against its background.',
+  '2.1.1': 'Keyboard users may not be able to reach or use this control.',
+  '2.4.1': 'Keyboard and screen reader users may have to go through repeated content before reaching the main content.',
+  '2.4.2': 'Screen reader users, and anyone switching tabs, may not know what this page is.',
+  '2.4.3': 'Keyboard users may move through the page in a confusing order.',
+  '2.4.4': 'Screen reader users may not know where this link goes.',
+  '2.4.6': 'People may not be able to tell sections or fields apart by their headings and labels.',
+  '2.4.7': 'Keyboard users may not see which element has focus.',
+  '2.5.3': 'Voice control users may not be able to activate this control by saying the label they see.',
+  '3.1.1': 'Screen readers may read this page with the wrong pronunciation.',
+  '3.3.1': 'People who cannot see the error styling may not know that, or why, a field is invalid.',
+  '3.3.2': 'People may not know what to enter in this field.',
+  '4.1.2': 'Screen reader users may not hear what this element is or what it does.',
+  '4.1.3': 'Screen reader users may not hear this status update.',
 }
 
 
@@ -129,7 +131,7 @@ export function whyItMatters(criteria) {
   const list = (Array.isArray(criteria) ? criteria : []).filter((c) => CRITERION.test(c))
   for (const c of list) if (WHO_IT_AFFECTS[c]) return WHO_IT_AFFECTS[c]
   const named = list.map((c) => (WCAG_NAMES[c] ? `${c} ${WCAG_NAMES[c]}` : c))
-  return named.length > 0 ? `It fails WCAG ${named.join(', ')}.` : null
+  return named.length > 0 ? `This affects WCAG ${named.join(', ')}.` : null
 }
 
 // "How to fix": the CLI's hint when it has a real one, otherwise the rule's guidance link.

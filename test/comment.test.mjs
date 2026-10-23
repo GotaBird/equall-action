@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import {
-  SCHEMA, MAX_INLINE, MAX_PAYLOAD_ISSUES,
+  SCHEMA, MAX_INLINE, MAX_PAYLOAD_ISSUES, WCAG_NAMES, WHO_IT_AFFECTS, whyItMatters,
   buildPayload, codeSpan, commentableLines, computeScope, countFixed, createClient, describeFailure, encodeData, howToFix,
   parseData, parseInlineMarker, plainMessage, renderInline, renderInlineResolved, renderSummary, run, skipReason, summaryMarker,
 } from '../comment.mjs'
@@ -546,6 +546,19 @@ test('client: never sends the token to another origin, never follows redirects',
   const spy = createClient({ apiUrl: 'https://api.github.com', token: 't', repository: 'a/b', fetchImpl: async (_u, i) => { init = i; return { status: 200, json: async () => [] } } })
   await spy.call('GET', '/pulls/1/files')
   assert.equal(init.redirect, 'error')
+})
+
+test('impact: every common criterion has a plain sentence, the others a fallback', () => {
+  for (const c of ['1.1.1', '1.3.1', '1.4.3', '2.1.1', '2.4.3', '2.4.4', '2.4.6', '2.4.7', '2.5.3', '3.1.1', '3.3.2', '4.1.2', '4.1.3']) {
+    const sentence = WHO_IT_AFFECTS[c]
+    assert.ok(typeof sentence === 'string' && /^[A-Z].{20,}\.$/.test(sentence), `${c} needs a sentence`)
+    assert.equal(whyItMatters([c]), sentence)
+    assert.ok(WCAG_NAMES[c], `${c} needs a name`)
+  }
+  assert.equal(WHO_IT_AFFECTS['2.4.7'], 'Keyboard users may not see which element has focus.')
+  assert.equal(WHO_IT_AFFECTS['3.3.2'], 'People may not know what to enter in this field.')
+  assert.equal(whyItMatters(['1.4.11']), 'This affects WCAG 1.4.11 Non-text Contrast.')
+  assert.equal(whyItMatters([]), null)
 })
 
 // ---------------------------------------------------------------------------------------------
