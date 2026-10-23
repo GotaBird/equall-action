@@ -97,13 +97,13 @@ test('patch: a trailing newline adds no phantom line', () => {
 
 test('inline: what is wrong, who it affects, how to fix, and a scoped marker with the fingerprint', () => {
   const [hero, signup] = fixture().new_issues
-  const body = renderInline(hero, SCOPE)
+  const body = renderInline([hero], SCOPE)
   assert.ok(body.startsWith(`<!-- equall:inline scope=${SCOPE} fp=a1b2c3d4e5f60718 -->`))
   assert.ok(body.includes('**New issue:** `img elements must have an alt prop'))
   assert.ok(!body.includes('(jsx-a11y/alt-text)`'), 'the rule id is not repeated in the message')
   assert.ok(body.includes('screen reader'))
   assert.ok(body.includes("[rule's guidance](https://github.com/jsx-eslint/"), 'no hint: the help link')
-  assert.deepEqual(parseInlineMarker(body), { scope: SCOPE, fp: 'a1b2c3d4e5f60718', resolved: false })
+  assert.deepEqual(parseInlineMarker(body), { scope: SCOPE, fps: ['a1b2c3d4e5f60718'], gone: [], resolved: false })
   // With a fix hint: the hint, not the link.
   const fix = howToFix(signup)
   assert.ok(fix.startsWith('**How to fix:** `Fix any of the following:`'))
@@ -112,17 +112,17 @@ test('inline: what is wrong, who it affects, how to fix, and a scoped marker wit
 })
 
 test('inline: unknown criterion falls back to its name, no emoji, no severity', () => {
-  const body = renderInline({ ...fixture().new_issues[0], wcag_criteria: ['2.4.6', '9.9.9', '<b>x</b>'] }, SCOPE)
-  assert.ok(body.includes('Headings and Labels'))
+  const body = renderInline([{ ...fixture().new_issues[0], wcag_criteria: ['3.2.4', '9.9.9', '<b>x</b>'] }], SCOPE)
+  assert.ok(body.includes('This affects WCAG 3.2.4 Consistent Identification, 9.9.9.'))
   assert.ok(!body.includes('<b>'))
   assert.ok(!/critical|serious/i.test(body))
   assert.ok(!/\p{Extended_Pictographic}/u.test(body))
 })
 
 test('inline: an issue no longer found is marked, keeps the original, and is detected as resolved', () => {
-  const original = renderInline(fixture().new_issues[0], SCOPE)
-  const body = renderInlineResolved(original, SCOPE, 'a1b2c3d4e5f60718', HEAD)
-  assert.deepEqual(parseInlineMarker(body), { scope: SCOPE, fp: 'a1b2c3d4e5f60718', resolved: true })
+  const original = renderInline([fixture().new_issues[0]], SCOPE)
+  const body = renderInlineResolved(original, SCOPE, ['a1b2c3d4e5f60718'], HEAD)
+  assert.deepEqual(parseInlineMarker(body), { scope: SCOPE, fps: ['a1b2c3d4e5f60718'], gone: [], resolved: true })
   assert.ok(body.includes('No longer found by the check on `aaaaaaa`'))
   assert.ok(body.includes('img elements must have an alt prop'))
   assert.equal((body.match(/<!-- equall:inline/g) ?? []).length, 1)
@@ -136,7 +136,7 @@ test('markdown injection: engine text cannot mention, link, embed or autolink', 
     suggestion: `Fix any of the following:\n  aria-label="${hostile}"\n  has \`backticks\` and | pipes`,
     file_path: 'src/@team/[a](https://phish.example).html',
   }
-  const inline = renderInline(issue, SCOPE)
+  const inline = renderInline([issue], SCOPE)
   const result = { ...fixture(), new_issues: [issue] }
   const summary = summaryFor(result)
   for (const [name, body] of [['inline', inline], ['summary', summary]]) {
@@ -150,9 +150,9 @@ test('markdown injection: engine text cannot mention, link, embed or autolink', 
   assert.equal(codeSpan('`x`'), '`` `x` ``')
 })
 
-const summaryFor = (result, { listed = result.new_issues, fixed = 0, url = null, scanPath = '.', fixedAtLeast = false } = {}) => {
+const summaryFor = (result, { listed = result.new_issues, fixed = 0, url = null, scanPath = '.', fixedAtLeast = false, inlineLines = 1 } = {}) => {
   const payload = buildPayload({ result, repository: 'acme/site', pullNumber: 42, headSha: HEAD, engineVersion: '0.3.4', fixed })
-  return renderSummary({ result, payload, listed, pullRequestUrl: url, scope: SCOPE, scanPath, fixedAtLeast })
+  return renderSummary({ result, payload, listed, pullRequestUrl: url, scope: SCOPE, scanPath, fixedAtLeast, inlineLines })
 }
 
 test('summary: verdict, the issues not shown inline, coverage and the uncounted lines', () => {
@@ -161,7 +161,7 @@ test('summary: verdict, the issues not shown inline, coverage and the uncounted 
   assert.ok(body.startsWith(summaryMarker(SCOPE)))
   assert.ok(body.includes('### Equall\n'))
   assert.ok(body.includes('Equall found 3 new accessibility issues in this pull request. 2 issues fixed since the last check.'))
-  assert.ok(body.includes('1 of them is commented on the changed lines.'))
+  assert.ok(body.includes('1 issue commented on 1 changed line.'))
   assert.ok(body.includes('<details><summary>2 issues not commented inline</summary>'))
   assert.ok(body.includes('| `src/pages/signup.html` | `Form elements must have labels` `label` | 4.1.2 |'))
   assert.ok(body.includes('| `src/components/Footer.tsx:40` |'))
@@ -393,13 +393,13 @@ test('later run with nothing new: summary updated to the resolved state, inline 
     assert.ok(summary.includes('No new accessibility issue found by static checks in this pull request. 3 issues fixed since the last check.'))
     assert.deepEqual(parseData(summary).counts, { new: 0, fixed: 3, legacy: 2, review_only: 1, not_testable: 2 })
     assert.equal(parseData(summary).head_sha, next)
-    assert.deepEqual(parseInlineMarker(gh.state.reviewComments[0].body), { scope: SCOPE, fp: 'a1b2c3d4e5f60718', resolved: true })
+    assert.deepEqual(parseInlineMarker(gh.state.reviewComments[0].body), { scope: SCOPE, fps: ['a1b2c3d4e5f60718'], gone: [], resolved: true })
     assertNoClaims(summary, fixture())
     // The issue comes back: the same inline comment is restored, not duplicated.
     const back = await runOnce(client, { ...fixture(), head: next }, { event: withHead(next) })
     assert.equal(back.posted, 0)
     assert.equal(gh.state.reviewComments.length, 1)
-    assert.deepEqual(parseInlineMarker(gh.state.reviewComments[0].body), { scope: SCOPE, fp: 'a1b2c3d4e5f60718', resolved: false })
+    assert.deepEqual(parseInlineMarker(gh.state.reviewComments[0].body), { scope: SCOPE, fps: ['a1b2c3d4e5f60718'], gone: [], resolved: false })
   })
 })
 
@@ -412,7 +412,7 @@ test('overflow: at most 10 inline comments, the rest in the summary', async () =
     assert.equal(res.posted, MAX_INLINE)
     const summary = gh.state.issueComments[0].body
     assert.ok(summary.includes('Equall found 12 new accessibility issues'))
-    assert.ok(summary.includes('10 of them are commented on the changed lines.'))
+    assert.ok(summary.includes('10 issues commented on 10 changed lines.'))
     assert.ok(summary.includes('2 issues not commented inline'))
     assert.ok(summary.includes('`src/Big.tsx:11`') && summary.includes('`src/Big.tsx:12`'))
   })
@@ -486,7 +486,7 @@ test('outdated inline comment (line gone after a push): the issue is commented a
     gh.state.reviewComments.push({ id: 5, user: { login: 'github-actions[bot]' }, path: 'src/components/Hero.tsx', line: null, original_line: 9, body: `<!-- equall:inline scope=${SCOPE} fp=a1b2c3d4e5f60718 -->\nold` })
     const res = await runOnce(client, fixture())
     assert.equal(res.posted, 1)
-    assert.ok(gh.state.issueComments[0].body.includes('1 of them is commented on the changed lines.'))
+    assert.ok(gh.state.issueComments[0].body.includes('1 issue commented on 1 changed line.'))
   })
 })
 
@@ -507,7 +507,7 @@ test('a rejected review falls back to single comments; the ones still refused go
     const res = await runOnce(client, fixture())
     assert.equal(res.posted, 0)
     assert.ok(gh.state.issueComments[0].body.includes('`src/components/Hero.tsx:14`'))
-    assert.ok(!gh.state.issueComments[0].body.includes('commented on the changed lines'))
+    assert.ok(!gh.state.issueComments[0].body.includes('commented on'))
   })
 })
 
@@ -548,6 +548,15 @@ test('client: never sends the token to another origin, never follows redirects',
   assert.equal(init.redirect, 'error')
 })
 
+// ---------------------------------------------------------------------------------------------
+// One comment per line
+
+const twoOnHero = () => {
+  const r = fixture()
+  const second = { ...r.new_issues[2], file_path: 'src/components/Hero.tsx', line: 14, fingerprint: '00aa00aa00aa00aa' }
+  return { ...r, new_issues: [r.new_issues[0], second, r.new_issues[1]] }
+}
+
 test('impact: every common criterion has a plain sentence, the others a fallback', () => {
   for (const c of ['1.1.1', '1.3.1', '1.4.3', '2.1.1', '2.4.3', '2.4.4', '2.4.6', '2.4.7', '2.5.3', '3.1.1', '3.3.2', '4.1.2', '4.1.3']) {
     const sentence = WHO_IT_AFFECTS[c]
@@ -561,12 +570,106 @@ test('impact: every common criterion has a plain sentence, the others a fallback
   assert.equal(whyItMatters([]), null)
 })
 
+test('grouping: several issues on one line render as one list, with every fingerprint sorted', () => {
+  const [a, b] = twoOnHero().new_issues
+  const body = renderInline([a, b], SCOPE)
+  assert.ok(body.startsWith(`<!-- equall:inline scope=${SCOPE} fp=00aa00aa00aa00aa,a1b2c3d4e5f60718 -->`))
+  assert.ok(body.includes('**2 new issues on this line:**'))
+  assert.ok(body.includes('- `img elements must have an alt prop'))
+  assert.ok(body.includes('\n  People using a screen reader may get no description'))
+  assert.ok(body.includes('- `Anchors must have content'))
+  assert.ok(body.includes('Screen reader users may not know where this link goes.'))
+  assert.equal((body.match(/rule's guidance/g) ?? []).length, 2)
+  assert.ok(body.includes('`jsx-a11y/alt-text`, `jsx-a11y/anchor-has-content`'))
+  assert.ok(body.includes('WCAG 1.1.1 Non-text Content, WCAG 2.4.4 Link Purpose (In Context), WCAG 4.1.2 Name, Role, Value'))
+  assert.deepEqual(parseInlineMarker(body).fps, ['00aa00aa00aa00aa', 'a1b2c3d4e5f60718'])
+})
+
+test('grouping: two issues on one line make one comment; the summary counts issues and lines', async () => {
+  await withMock({ files: FILES }, async (gh, client) => {
+    const res = await runOnce(client, twoOnHero())
+    assert.equal(res.posted, 1)
+    assert.equal(gh.state.reviewComments.length, 1)
+    assert.ok(gh.state.reviewComments[0].body.includes('**2 new issues on this line:**'))
+    assert.ok(gh.state.issueComments[0].body.includes('2 issues commented on 1 changed line.'))
+    // Re-run: nothing written.
+    const before = gh.state.requests.length
+    assert.deepEqual(await runOnce(client, twoOnHero()), { skipped: false, posted: 0, marked: 0, summary: 'unchanged' })
+    assert.ok(gh.state.requests.slice(before).every((r) => r.method === 'GET'))
+  })
+})
+
+test('grouping: when some issues of a comment are gone, it lists the others and says so', async () => {
+  await withMock({ files: FILES }, async (gh, client) => {
+    await runOnce(client, twoOnHero())
+    const next = 'c'.repeat(40)
+    gh.state.prHead = next
+    const partial = { ...twoOnHero(), head: next }
+    partial.new_issues = partial.new_issues.filter((i) => i.fingerprint !== 'a1b2c3d4e5f60718')
+    const res = await runOnce(client, partial, { event: withHead(next) })
+    assert.equal(res.marked, 0)
+    const body = gh.state.reviewComments[0].body
+    assert.deepEqual(parseInlineMarker(body), { scope: SCOPE, fps: ['00aa00aa00aa00aa', 'a1b2c3d4e5f60718'], gone: ['a1b2c3d4e5f60718'], resolved: false })
+    assert.ok(body.includes('**1 new issue on this line:**'))
+    assert.ok(!body.includes('img elements must have'))
+    assert.ok(body.includes('1 of these is no longer found on `ccccccc`.'))
+    assert.ok(gh.state.issueComments[0].body.includes('1 issue fixed since the last check.'))
+    // Same state again: not edited (the commit in the note stays the one it was first seen on).
+    const later = 'f'.repeat(40)
+    gh.state.prHead = later
+    const before = gh.state.requests.length
+    await runOnce(client, { ...partial, head: later }, { event: withHead(later) })
+    assert.equal(gh.state.requests.slice(before).filter((r) => r.path.includes('/pulls/comments/')).length, 0)
+    // All gone: the resolved state, every fingerprint kept.
+    const none = 'b'.repeat(40)
+    gh.state.prHead = none
+    const all = await runOnce(client, { ...partial, head: none, new_issues: partial.new_issues.filter((i) => i.fingerprint !== '00aa00aa00aa00aa') }, { event: withHead(none) })
+    assert.equal(all.marked, 1)
+    assert.deepEqual(parseInlineMarker(gh.state.reviewComments[0].body), { scope: SCOPE, fps: ['00aa00aa00aa00aa', 'a1b2c3d4e5f60718'], gone: [], resolved: true })
+  })
+})
+
+test('grouping: a new issue on a line that already has a comment joins it', async () => {
+  await withMock({ files: FILES }, async (gh, client) => {
+    const first = fixture()
+    await runOnce(client, first)
+    const res = await runOnce(client, twoOnHero())
+    assert.equal(res.posted, 0)
+    assert.equal(gh.state.reviewComments.length, 1, 'no second comment on the same line')
+    const marker = parseInlineMarker(gh.state.reviewComments[0].body)
+    assert.deepEqual(marker.fps, ['00aa00aa00aa00aa', 'a1b2c3d4e5f60718'])
+    assert.ok(gh.state.reviewComments[0].body.includes('**2 new issues on this line:**'))
+    assert.ok(gh.state.issueComments[0].body.includes('2 issues commented on 1 changed line.'))
+  })
+})
+
+test('grouping: the limit of 10 counts comments, not issues', async () => {
+  const lines = Array.from({ length: 14 }, (_, k) => `+line ${k}`).join('\n')
+  const files = [{ filename: 'src/Big.tsx', patch: `@@ -0,0 +1,14 @@\n${lines}` }]
+  const base = fixture().new_issues[0]
+  const issues = Array.from({ length: 12 }, (_, k) => [
+    { ...base, file_path: 'src/Big.tsx', line: k + 1, fingerprint: `a${k}` },
+    { ...base, file_path: 'src/Big.tsx', line: k + 1, scanner_rule_id: 'jsx-a11y/anchor-has-content', fingerprint: `b${k}` },
+  ]).flat()
+  await withMock({ files }, async (gh, client) => {
+    const res = await runOnce(client, { ...fixture(), new_issues: issues })
+    assert.equal(res.posted, MAX_INLINE)
+    assert.equal(gh.state.reviewComments.length, MAX_INLINE)
+    const summary = gh.state.issueComments[0].body
+    assert.ok(summary.includes('Equall found 24 new accessibility issues'))
+    assert.ok(summary.includes('20 issues commented on 10 changed lines.'))
+    assert.ok(summary.includes('4 issues not commented inline'))
+  })
+})
+
 // ---------------------------------------------------------------------------------------------
 // Sample output, printed with EQUALL_PRINT_SAMPLES=1 for review
 
 test('sample: fixture rendering', { skip: !process.env.EQUALL_PRINT_SAMPLES }, () => {
   const result = fixture()
-  console.log(renderInline(result.new_issues[0], SCOPE))
+  console.log(renderInline([result.new_issues[0]], SCOPE))
+  console.log('\n-----\n')
+  console.log(renderInline([result.new_issues[0], { ...result.new_issues[2], file_path: result.new_issues[0].file_path, line: 14 }], SCOPE))
   console.log('\n-----\n')
   console.log(summaryFor(result, { listed: result.new_issues.slice(1), url: 'https://equallscan.com/dashboard/acme/site/pr/42' }))
 })
