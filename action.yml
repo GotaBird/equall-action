@@ -34,6 +34,10 @@ inputs:
     description: "The project's key from its settings on Equall. Not a secret: pass it as a repository variable."
     required: false
     default: ''
+  comment:
+    description: "Comment on the pull request with the issues it introduces: inline on the changed lines, plus one summary kept up to date. Needs `permissions: pull-requests: write`."
+    required: false
+    default: 'false'
 
 runs:
   using: 'composite'
@@ -44,6 +48,7 @@ runs:
       env:
         REPORT_TO: ${{ inputs.report-to }}
         PROJECT_KEY: ${{ inputs.project-key }}
+        COMMENT_INPUT: ${{ inputs.comment }}
       run: |
         set -euo pipefail
         report=false
@@ -64,8 +69,19 @@ runs:
               report=false ;;
           esac
         fi
+        # Comments only on pull requests that open or move, never on closed or other events.
+        comment=false
+        if [ "$COMMENT_INPUT" = "true" ] && [ "$mode" = "scan" ] && [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
+          pr_action=$(node -e 'const e=require(process.env.GITHUB_EVENT_PATH); process.stdout.write(String(e.action||""))')
+          case "$pr_action" in
+            opened|synchronize|reopened|ready_for_review) comment=true ;;
+          esac
+        elif [ "$COMMENT_INPUT" != "true" ] && [ "$COMMENT_INPUT" != "false" ]; then
+          echo "::warning title=Equall::comment must be true or false. No comment will be posted."
+        fi
         echo "report=$report" >> "$GITHUB_OUTPUT"
         echo "mode=$mode" >> "$GITHUB_OUTPUT"
+        echo "comment=$comment" >> "$GITHUB_OUTPUT"
 
     - name: Fetch the history the comparison needs
       if: steps.mode.outputs.mode == 'scan'
@@ -85,6 +101,7 @@ runs:
         fi
 
     - name: Equall
+      id: scan
       if: steps.mode.outputs.mode == 'scan'
       shell: bash
       env:
@@ -94,12 +111,15 @@ runs:
         LEVEL: ${{ inputs.level }}
         EQUALL_VERSION: ${{ inputs.version }}
         REPORT: ${{ steps.mode.outputs.report }}
+        COMMENT: ${{ steps.mode.outputs.comment }}
         EQUALL_REPORT_TO: ${{ inputs.report-to }}
         EQUALL_PROJECT_KEY: ${{ inputs.project-key }}
         ACTION_PATH: ${{ github.action_path }}
       run: |
         set -euo pipefail
-        if [ "$REPORT" != "true" ] || [ "${GITHUB_EVENT_NAME:-}" != "pull_request" ]; then
+        result="${RUNNER_TEMP}/equall-result.json"
+        rm -f "$result" "${RUNNER_TEMP}/equall-pr-url.txt" "${RUNNER_TEMP}/equall-engine-version.txt"
+        if { [ "$REPORT" != "true" ] && [ "$COMMENT" != "true" ]; } || [ "${GITHUB_EVENT_NAME:-}" != "pull_request" ]; then
           if [ -n "$BASE_INPUT" ]; then
             npx --yes "equall-cli@${EQUALL_VERSION}" scan "$SCAN_PATH" --level "$LEVEL" --diff "$BASE_INPUT" --fail-on "$FAIL_ON"
           elif [ -n "${GITHUB_BASE_REF:-}" ]; then
@@ -110,11 +130,11 @@ runs:
           fi
           exit 0
         fi
-        # Reporting: pin the exact version once, so the version reported is the one that ran.
+        # Reporting or commenting: pin the exact version once, so the version reported is the
+        # one that ran, and keep the JSON result for the steps that follow.
         EQUALL_ENGINE_VERSION=$(env -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN npx --yes "equall-cli@${EQUALL_VERSION}" --version)
         export EQUALL_ENGINE_VERSION
-        result="${RUNNER_TEMP}/equall-result.json"
-        rm -f "$result"
+        printf '%s' "$EQUALL_ENGINE_VERSION" > "${RUNNER_TEMP}/equall-engine-version.txt"
         set +e
         # ${BASE_INPUT:+...} expands to nothing when no base is given: a bare --diff then
         # compares against the pull request target branch, as above.
@@ -124,10 +144,28 @@ runs:
         code=$?
         set -e
         # 2 means the check could not run: there is no result to report.
-        if [ "$code" -ne 2 ]; then
-          node "$ACTION_PATH/report.mjs" check "$result" "$code"
+        if [ "$code" -ne 2 ] && [ "$REPORT" = "true" ]; then
+          EQUALL_PR_URL_FILE="${RUNNER_TEMP}/equall-pr-url.txt" node "$ACTION_PATH/report.mjs" check "$result" "$code"
         fi
         exit "$code"
+
+    # Runs after the gate, even when it fails, and never changes the job's result.
+    - name: Comment on the pull request
+      if: always() && steps.mode.outputs.comment == 'true' && steps.scan.outcome != 'skipped'
+      continue-on-error: true
+      shell: bash
+      env:
+        EQUALL_GITHUB_TOKEN: ${{ github.token }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        result="${RUNNER_TEMP}/equall-result.json"
+        if [ ! -f "$result" ]; then
+          echo "::notice title=Equall::The check could not run: no comment."
+          exit 0
+        fi
+        EQUALL_ENGINE_VERSION=$(cat "${RUNNER_TEMP}/equall-engine-version.txt" 2>/dev/null || true) \
+          EQUALL_PR_URL_FILE="${RUNNER_TEMP}/equall-pr-url.txt" \
+          node "$ACTION_PATH/comment.mjs" "$result" || true
 
     - name: Report the closed pull request
       if: steps.mode.outputs.mode == 'closed'

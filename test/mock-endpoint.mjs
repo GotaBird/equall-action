@@ -3,7 +3,8 @@ import { createServer } from 'node:http'
 import { appendFileSync } from 'node:fs'
 
 const [port, out] = process.argv.slice(2)
-createServer((req, res) => {
+// Without arguments (for example when a test runner loads every file in test/), do nothing.
+if (port && out) createServer((req, res) => {
   let body = ''
   req.on('data', (c) => { body += c })
   req.on('end', () => {
