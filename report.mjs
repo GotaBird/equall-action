@@ -12,6 +12,7 @@ import { pathToFileURL } from 'node:url'
 
 export const AUDIENCE = 'https://equallscan.com'
 export const MAX_FINDINGS = 5000
+export const PULL_REQUEST_URL_HOSTS = ['equallscan.com', 'www.equallscan.com']
 export const MAX_BYTES = 2 * 1024 * 1024
 const SEVERITIES = ['critical', 'serious', 'moderate', 'minor']
 const SHA = /^[0-9a-f]{40}$/
@@ -110,7 +111,8 @@ export function isAllowedUrl(raw) {
 }
 
 // The pull request page on Equall, as the ingest response gives it. It is put in a comment on
-// the pull request, so only an https link to Equall itself is accepted.
+// the pull request, so only an https link to Equall's own site is accepted: exact hosts, no
+// wildcard.
 export function isAllowedPullRequestUrl(raw) {
   if (typeof raw !== 'string' || raw.length === 0 || raw.length > 2048) return false
   let u
@@ -120,7 +122,7 @@ export function isAllowedPullRequestUrl(raw) {
     return false
   }
   if (u.protocol !== 'https:' || u.username !== '' || u.password !== '' || u.port !== '') return false
-  return u.hostname === 'equallscan.com' || u.hostname.endsWith('.equallscan.com')
+  return PULL_REQUEST_URL_HOSTS.includes(u.hostname)
 }
 
 export function classify(status) {
@@ -283,7 +285,7 @@ export function savePullRequestUrl({ status, payload }, path) {
   return true
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main(process.argv.slice(2), process.env).catch((err) => {
     warning(`Reporting failed: ${err instanceof Error ? err.message : String(err)}. The check itself is unaffected.`)
   })
