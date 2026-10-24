@@ -4,7 +4,8 @@ import { readFileSync } from 'node:fs'
 import {
   SCHEMA, MAX_INLINE, MAX_PAYLOAD_ISSUES, WCAG_NAMES, WHO_IT_AFFECTS, whyItMatters,
   buildPayload, codeSpan, commentableLines, computeScope, countFixed, createClient, describeFailure, encodeData, howToFix,
-  parseData, parseInlineMarker, plainMessage, renderInline, renderInlineResolved, renderSummary, run, skipReason, summaryMarker,
+  parseData, parseInlineMarker, plainMessage, renderInline, renderInlineMoved, renderInlineResolved, renderSummary, run, skipReason, summaryMarker,
+  isPermissionError, fetchThreads, snippetOf, ApiError,
 } from '../comment.mjs'
 import { isAllowedPullRequestUrl, savePullRequestUrl } from '../report.mjs'
 import { startMockGitHub } from './mock-github.mjs'
@@ -25,11 +26,17 @@ const withHead = (sha) => event({ pull_request: { ...event().pull_request, head:
 // in the diff at all.
 const PATCH_HERO = '@@ -10,5 +10,7 @@ export function Hero() {\n   return (\n     <section>\n       <div>\n-      <h1>Old</h1>\n+      <h1>New</h1>\n+      <img src="hero.png" />\n+      <p>Intro</p>\n     </section>'
 const PATCH_FOOTER = '@@ -1,3 +1,4 @@\n import x from "y"\n+import z from "w"\n \n export const a = 1'
+// signup.html (whose issue has no line) is not part of these pull requests: FILES_HTML adds it,
+// for the file-level comments.
 const FILES = [
   { filename: 'src/components/Hero.tsx', patch: PATCH_HERO },
   { filename: 'src/components/Footer.tsx', patch: PATCH_FOOTER },
-  { filename: 'src/pages/signup.html', patch: '@@ -0,0 +1,2 @@\n+<form>\n+</form>' },
 ]
+const SIGNUP = { filename: 'src/pages/signup.html', patch: '@@ -0,0 +1,2 @@\n+<form>\n+</form>' }
+const FILES_HTML = [...FILES, SIGNUP]
+
+// A request that changes nothing: a REST GET, or a GraphQL query (not a mutation).
+const isRead = (r) => r.method === 'GET' || (r.path === '/graphql' && !/^\s*mutation/.test(r.body?.query ?? ''))
 
 const silent = () => {
   const out = { notice: [], warning: [], debug: [] }
@@ -103,7 +110,7 @@ test('inline: what is wrong, who it affects, how to fix, and a scoped marker wit
   assert.ok(!body.includes('(jsx-a11y/alt-text)`'), 'the rule id is not repeated in the message')
   assert.ok(body.includes('screen reader'))
   assert.ok(body.includes("[rule's guidance](https://github.com/jsx-eslint/"), 'no hint: the help link')
-  assert.deepEqual(parseInlineMarker(body), { scope: SCOPE, fps: ['a1b2c3d4e5f60718'], gone: [], resolved: false })
+  assert.deepEqual(parseInlineMarker(body), { scope: SCOPE, fps: ['a1b2c3d4e5f60718'], gone: [], resolved: false, moved: false })
   // With a fix hint: the hint, not the link.
   const fix = howToFix(signup)
   assert.ok(fix.startsWith('**How to fix:** `Fix any of the following:`'))
@@ -122,7 +129,7 @@ test('inline: unknown criterion falls back to its name, no emoji, no severity', 
 test('inline: an issue no longer found is marked, keeps the original, and is detected as resolved', () => {
   const original = renderInline([fixture().new_issues[0]], SCOPE)
   const body = renderInlineResolved(original, SCOPE, ['a1b2c3d4e5f60718'], HEAD)
-  assert.deepEqual(parseInlineMarker(body), { scope: SCOPE, fps: ['a1b2c3d4e5f60718'], gone: [], resolved: true })
+  assert.deepEqual(parseInlineMarker(body), { scope: SCOPE, fps: ['a1b2c3d4e5f60718'], gone: [], resolved: true, moved: false })
   assert.ok(body.includes('No longer found by the check on `aaaaaaa`'))
   assert.ok(body.includes('img elements must have an alt prop'))
   assert.equal((body.match(/<!-- equall:inline/g) ?? []).length, 1)
@@ -150,9 +157,9 @@ test('markdown injection: engine text cannot mention, link, embed or autolink', 
   assert.equal(codeSpan('`x`'), '`` `x` ``')
 })
 
-const summaryFor = (result, { listed = result.new_issues, fixed = 0, url = null, scanPath = '.', fixedAtLeast = false, inlineLines = 1 } = {}) => {
+const summaryFor = (result, { listed = result.new_issues, fixed = 0, url = null, scanPath = '.', fixedAtLeast = false, inlineLines = 1, inlineFiles = 0 } = {}) => {
   const payload = buildPayload({ result, repository: 'acme/site', pullNumber: 42, headSha: HEAD, engineVersion: '0.3.4', fixed })
-  return renderSummary({ result, payload, listed, pullRequestUrl: url, scope: SCOPE, scanPath, fixedAtLeast, inlineLines })
+  return renderSummary({ result, payload, listed, pullRequestUrl: url, scope: SCOPE, scanPath, fixedAtLeast, inlineLines, inlineFiles })
 }
 
 test('summary: verdict, the issues not shown inline, coverage and the uncounted lines', () => {
@@ -322,7 +329,7 @@ test('permission: a 403 on the first write is the pull-requests: write warning',
       assert.match(describeFailure(err).message, /pull-requests: write/)
       return true
     })
-    assert.equal(gh.state.requests.filter((r) => r.method !== 'GET').length, 1, 'stops after the first refused write')
+    assert.equal(gh.state.requests.filter((r) => !isRead(r)).length, 1, 'stops after the first refused write')
   })
 })
 
@@ -342,7 +349,7 @@ test('nothing new and no previous comment: no comment at all', async () => {
   await withMock({ files: FILES }, async (gh, client) => {
     const res = await runOnce(client, { ...fixture(), new_issues: [] })
     assert.equal(res.summary, 'none')
-    assert.ok(gh.state.requests.every((r) => r.method === 'GET'))
+    assert.ok(gh.state.requests.every(isRead))
   })
 })
 
@@ -363,9 +370,9 @@ test('first run: one review with the issue on a diff line, one summary listing t
     const summary = gh.state.issueComments[0].body
     assert.ok(summary.includes('Equall found 3 new accessibility issues'))
     assert.ok(summary.includes('`src/components/Footer.tsx:40`'), 'a line outside the diff goes to the summary')
-    assert.ok(summary.includes('`src/pages/signup.html`'), 'an issue without a line goes to the summary')
+    assert.ok(summary.includes('`src/pages/signup.html`'), 'an issue without a line, in a file outside the diff, goes to the summary')
     // Pagination: files were served one per page.
-    assert.equal(gh.state.requests.filter((r) => r.path.endsWith('/files')).length, 3)
+    assert.equal(gh.state.requests.filter((r) => r.path.endsWith('/files')).length, 2)
   })
 })
 
@@ -375,7 +382,7 @@ test('re-run on the same commit: no duplicate inline comment, summary untouched'
     const before = gh.state.requests.length
     const res = await runOnce(client, fixture())
     assert.deepEqual(res, { skipped: false, posted: 0, marked: 0, summary: 'unchanged' })
-    assert.ok(gh.state.requests.slice(before).every((r) => r.method === 'GET'))
+    assert.ok(gh.state.requests.slice(before).every(isRead))
     assert.equal(gh.state.reviewComments.length, 1)
     assert.equal(gh.state.issueComments.length, 1)
   })
@@ -393,13 +400,21 @@ test('later run with nothing new: summary updated to the resolved state, inline 
     assert.ok(summary.includes('No new accessibility issue found by static checks in this pull request. 3 issues fixed since the last check.'))
     assert.deepEqual(parseData(summary).counts, { new: 0, fixed: 3, legacy: 2, review_only: 1, not_testable: 2 })
     assert.equal(parseData(summary).head_sha, next)
-    assert.deepEqual(parseInlineMarker(gh.state.reviewComments[0].body), { scope: SCOPE, fps: ['a1b2c3d4e5f60718'], gone: [], resolved: true })
+    assert.deepEqual(parseInlineMarker(gh.state.reviewComments[0].body), { scope: SCOPE, fps: ['a1b2c3d4e5f60718'], gone: [], resolved: true, moved: false })
     assertNoClaims(summary, fixture())
-    // The issue comes back: the same inline comment is restored, not duplicated.
+    // The token can resolve threads here: the thread is resolved, nothing hidden or deleted.
+    assert.equal(gh.state.threads.get(gh.state.reviewComments[0].id).isResolved, true)
+    assert.equal(gh.state.minimized.size, 0)
+    // The issue comes back: the resolved thread stays closed, and the issue is commented again
+    // once (not on every later run).
     const back = await runOnce(client, { ...fixture(), head: next }, { event: withHead(next) })
-    assert.equal(back.posted, 0)
-    assert.equal(gh.state.reviewComments.length, 1)
-    assert.deepEqual(parseInlineMarker(gh.state.reviewComments[0].body), { scope: SCOPE, fps: ['a1b2c3d4e5f60718'], gone: [], resolved: false })
+    assert.equal(back.posted, 1)
+    assert.equal(gh.state.reviewComments.length, 2)
+    assert.equal(parseInlineMarker(gh.state.reviewComments[0].body).resolved, true)
+    assert.deepEqual(parseInlineMarker(gh.state.reviewComments[1].body), { scope: SCOPE, fps: ['a1b2c3d4e5f60718'], gone: [], resolved: false, moved: false })
+    const again = await runOnce(client, { ...fixture(), head: next }, { event: withHead(next) })
+    assert.equal(again.posted, 0)
+    assert.equal(gh.state.reviewComments.length, 2)
   })
 })
 
@@ -483,10 +498,13 @@ test('writes are independent: a PATCH answering 404 mid-loop does not stop the o
 
 test('outdated inline comment (line gone after a push): the issue is commented again', async () => {
   await withMock({ files: FILES }, async (gh, client) => {
-    gh.state.reviewComments.push({ id: 5, user: { login: 'github-actions[bot]' }, path: 'src/components/Hero.tsx', line: null, original_line: 9, body: `<!-- equall:inline scope=${SCOPE} fp=a1b2c3d4e5f60718 -->\nold` })
+    gh.state.reviewComments.push({ id: 5, node_id: 'PRRC_5', user: { login: 'github-actions[bot]' }, path: 'src/components/Hero.tsx', line: null, original_line: 9, body: `<!-- equall:inline scope=${SCOPE} fp=a1b2c3d4e5f60718 -->\nold` })
     const res = await runOnce(client, fixture())
     assert.equal(res.posted, 1)
     assert.ok(gh.state.issueComments[0].body.includes('1 issue commented on 1 changed line.'))
+    // The old comment says why and is hidden as outdated: one live comment per issue.
+    assert.equal(parseInlineMarker(gh.state.reviewComments[0].body).moved, true)
+    assert.equal(gh.state.minimized.get(5), 'OUTDATED')
   })
 })
 
@@ -532,7 +550,7 @@ test('stale check: the pull request moved on, nothing is written', async () => {
     const { out, log } = silent()
     const res = await runOnce(client, fixture(), { log })
     assert.equal(res.skipped, true)
-    assert.ok(gh.state.requests.every((r) => r.method === 'GET'))
+    assert.ok(gh.state.requests.every(isRead))
     assert.match(out.notice[0], /changed since this check/)
   })
 })
@@ -595,7 +613,7 @@ test('grouping: two issues on one line make one comment; the summary counts issu
     // Re-run: nothing written.
     const before = gh.state.requests.length
     assert.deepEqual(await runOnce(client, twoOnHero()), { skipped: false, posted: 0, marked: 0, summary: 'unchanged' })
-    assert.ok(gh.state.requests.slice(before).every((r) => r.method === 'GET'))
+    assert.ok(gh.state.requests.slice(before).every(isRead))
   })
 })
 
@@ -609,7 +627,7 @@ test('grouping: when some issues of a comment are gone, it lists the others and 
     const res = await runOnce(client, partial, { event: withHead(next) })
     assert.equal(res.marked, 0)
     const body = gh.state.reviewComments[0].body
-    assert.deepEqual(parseInlineMarker(body), { scope: SCOPE, fps: ['00aa00aa00aa00aa', 'a1b2c3d4e5f60718'], gone: ['a1b2c3d4e5f60718'], resolved: false })
+    assert.deepEqual(parseInlineMarker(body), { scope: SCOPE, fps: ['00aa00aa00aa00aa', 'a1b2c3d4e5f60718'], gone: ['a1b2c3d4e5f60718'], resolved: false, moved: false })
     assert.ok(body.includes('**1 new issue on this line:**'))
     assert.ok(!body.includes('img elements must have'))
     assert.ok(body.includes('1 of these is no longer found on `ccccccc`.'))
@@ -625,7 +643,7 @@ test('grouping: when some issues of a comment are gone, it lists the others and 
     gh.state.prHead = none
     const all = await runOnce(client, { ...partial, head: none, new_issues: partial.new_issues.filter((i) => i.fingerprint !== '00aa00aa00aa00aa') }, { event: withHead(none) })
     assert.equal(all.marked, 1)
-    assert.deepEqual(parseInlineMarker(gh.state.reviewComments[0].body), { scope: SCOPE, fps: ['00aa00aa00aa00aa', 'a1b2c3d4e5f60718'], gone: [], resolved: true })
+    assert.deepEqual(parseInlineMarker(gh.state.reviewComments[0].body), { scope: SCOPE, fps: ['00aa00aa00aa00aa', 'a1b2c3d4e5f60718'], gone: [], resolved: true, moved: false })
   })
 })
 
@@ -660,6 +678,374 @@ test('grouping: the limit of 10 counts comments, not issues', async () => {
     assert.ok(summary.includes('20 issues commented on 10 changed lines.'))
     assert.ok(summary.includes('4 issues not commented inline'))
   })
+})
+
+// ---------------------------------------------------------------------------------------------
+// Lifecycle: fixed, outdated, resolved by hand
+
+const BOT = { login: 'github-actions[bot]', type: 'Bot' }
+const NEXT = 'c'.repeat(40)
+// A later push: the pull request head moves on, and the check runs on it.
+const later = (gh, client, result, over = {}) => {
+  gh.state.prHead = NEXT
+  return runOnce(client, { ...result, head: NEXT }, { event: withHead(NEXT), ...over })
+}
+const mutations = (gh, name) => gh.state.requests.filter((r) => r.path === '/graphql' && (r.body?.query ?? '').includes(name))
+const deletes = (gh) => gh.state.requests.filter((r) => r.method === 'DELETE')
+// Two comments on two lines, both fixed on the next push.
+const twoLines = () => {
+  const r = fixture()
+  return { ...r, new_issues: [r.new_issues[0], { ...r.new_issues[0], line: 15, fingerprint: 'b1b2b3b4b5b6b7b8' }] }
+}
+
+test('fixed: the thread is resolved when the token can, after the text says why', async () => {
+  await withMock({ files: FILES }, async (gh, client) => {
+    await runOnce(client, twoLines())
+    const { out, log } = silent()
+    const res = await later(gh, client, { ...fixture(), new_issues: [] }, { log })
+    assert.equal(res.marked, 2)
+    for (const c of gh.state.reviewComments) {
+      assert.equal(parseInlineMarker(c.body).resolved, true)
+      assert.equal(gh.state.threads.get(c.id).isResolved, true)
+    }
+    assert.equal(mutations(gh, 'minimizeComment').length, 0)
+    assert.equal(deletes(gh).length, 0)
+    assert.equal(out.notice.length, 0, 'nothing to explain')
+    // Edit first, then resolve: if the thread stays visible, it says why.
+    const order = gh.state.requests.filter((r) => r.method === 'PATCH' || mutations(gh, 'resolveReviewThread').includes(r))
+    assert.equal(order[0].method, 'PATCH')
+  })
+})
+
+test('fixed: resolving is forbidden (no contents: write), so the comment is hidden as resolved, and that is tried once', async () => {
+  await withMock({ files: FILES, resolve: 'forbidden' }, async (gh, client) => {
+    await runOnce(client, twoLines())
+    const { out, log } = silent()
+    const res = await later(gh, client, { ...fixture(), new_issues: [] }, { log })
+    assert.equal(res.marked, 2)
+    assert.equal(mutations(gh, 'resolveReviewThread').length, 1, 'a permission error is not retried for every comment')
+    assert.deepEqual([...gh.state.minimized.values()], ['RESOLVED', 'RESOLVED'])
+    assert.equal(deletes(gh).length, 0)
+    assert.equal(out.notice.length, 1, 'one notice for the run')
+    assert.match(out.notice[0], /contents: write/)
+    assert.equal(out.warning.length, 0)
+    // Idempotent: a later run writes nothing.
+    const before = gh.state.requests.length
+    await later(gh, client, { ...fixture(), new_issues: [] })
+    assert.ok(gh.state.requests.slice(before).every(isRead))
+  })
+})
+
+test('fixed: resolving and hiding both refused, so the comment is deleted', async () => {
+  await withMock({ files: FILES, resolve: 'forbidden', minimize: 'forbidden' }, async (gh, client) => {
+    await runOnce(client, twoLines())
+    const { out, log } = silent()
+    const res = await later(gh, client, { ...fixture(), new_issues: [] }, { log })
+    assert.equal(res.marked, 2)
+    assert.equal(mutations(gh, 'minimizeComment').length, 1, 'tried once')
+    assert.equal(deletes(gh).length, 2)
+    assert.equal(gh.state.reviewComments.length, 0)
+    assert.equal(out.notice.length, 1)
+    assert.equal(gh.state.issueComments.length, 1, 'the summary is never deleted')
+    assert.ok(gh.state.issueComments[0].body.includes('No new accessibility issue found by static checks'))
+  })
+})
+
+test('fixed: hiding fails for another reason, so the comment is deleted; a comment someone answered is kept', async () => {
+  await withMock({ files: FILES, resolve: 'forbidden', minimize: 'error' }, async (gh, client) => {
+    await runOnce(client, twoLines())
+    const [answered, alone] = gh.state.reviewComments
+    gh.state.reviewComments.push({ id: 7, user: { login: 'octocat', type: 'User' }, in_reply_to_id: answered.id, path: answered.path, line: answered.line, body: 'Will fix.' })
+    await later(gh, client, { ...fixture(), new_issues: [] })
+    assert.deepEqual(deletes(gh).map((r) => r.path), [`/repos/acme/site/pulls/comments/${alone.id}`])
+    const kept = gh.state.reviewComments.find((c) => c.id === answered.id)
+    assert.equal(parseInlineMarker(kept.body).resolved, true, 'kept, saying why')
+  })
+})
+
+test('fixed: without GraphQL, the comment is deleted', async () => {
+  await withMock({ files: FILES, graphql: false }, async (gh, client) => {
+    await runOnce(client, fixture())
+    const res = await later(gh, client, { ...fixture(), new_issues: [] })
+    assert.equal(res.marked, 1)
+    assert.equal(deletes(gh).length, 1)
+    assert.equal(gh.state.reviewComments.length, 0)
+  })
+})
+
+test('outdated: the issue is still found elsewhere, so it is commented on its current line and the old comment is hidden', async () => {
+  await withMock({ files: FILES }, async (gh, client) => {
+    await runOnce(client, fixture())
+    const old = gh.state.reviewComments[0]
+    old.line = null // the push changed that line: GitHub marks the comment outdated
+    const moved = fixture()
+    moved.new_issues[0] = { ...moved.new_issues[0], line: 15 }
+    const res = await later(gh, client, moved)
+    assert.equal(res.posted, 1)
+    const fresh = gh.state.reviewComments[1]
+    assert.deepEqual([fresh.path, fresh.line], ['src/components/Hero.tsx', 15])
+    assert.deepEqual(parseInlineMarker(fresh.body).fps, ['a1b2c3d4e5f60718'], 'same fingerprint, new anchor')
+    assert.equal(parseInlineMarker(old.body).moved, true)
+    assert.ok(old.body.includes('commented again where they are now'))
+    assert.equal(gh.state.minimized.get(old.id), 'OUTDATED')
+    assert.equal(mutations(gh, 'resolveReviewThread').length, 0, 'an outdated comment is hidden, not resolved')
+    assert.ok(gh.state.issueComments[0].body.includes('1 issue commented on 1 changed line.'))
+    // Idempotent: one live comment for the issue, no write on the next run.
+    const before = gh.state.requests.length
+    const again = await later(gh, client, moved)
+    assert.equal(again.posted, 0)
+    assert.ok(gh.state.requests.slice(before).every(isRead))
+  })
+})
+
+test('outdated: hiding refused, so the old comment is deleted', async () => {
+  await withMock({ files: FILES, minimize: 'forbidden' }, async (gh, client) => {
+    await runOnce(client, fixture())
+    gh.state.reviewComments[0].line = null
+    const res = await later(gh, client, fixture())
+    assert.equal(res.posted, 1)
+    assert.equal(gh.state.reviewComments.length, 1)
+    assert.equal(gh.state.reviewComments[0].line, 14)
+    assert.equal(deletes(gh).length, 1)
+  })
+})
+
+test('outdated and partly fixed: only the issues still found are commented again', async () => {
+  await withMock({ files: FILES }, async (gh, client) => {
+    await runOnce(client, twoOnHero())
+    gh.state.reviewComments[0].line = null
+    const partial = twoOnHero()
+    partial.new_issues = partial.new_issues.filter((i) => i.fingerprint !== 'a1b2c3d4e5f60718')
+    const res = await later(gh, client, partial)
+    assert.equal(res.posted, 1)
+    assert.deepEqual(parseInlineMarker(gh.state.reviewComments[1].body).fps, ['00aa00aa00aa00aa'])
+    assert.equal(gh.state.minimized.get(gh.state.reviewComments[0].id), 'OUTDATED')
+  })
+})
+
+test('outdated per the review thread (GraphQL), with its line still set: replaced too', async () => {
+  await withMock({ files: FILES }, async (gh, client) => {
+    await runOnce(client, fixture())
+    gh.state.threads.set(gh.state.reviewComments[0].id, { isResolved: false, resolvedBy: null, isOutdated: true })
+    const res = await later(gh, client, fixture())
+    assert.equal(res.posted, 1)
+    assert.equal(parseInlineMarker(gh.state.reviewComments[0].body).moved, true)
+  })
+})
+
+test('resolved by hand: the thread stays resolved, its issues are not commented again, the summary says so', async () => {
+  await withMock({ files: FILES }, async (gh, client) => {
+    await runOnce(client, fixture())
+    const c = gh.state.reviewComments[0]
+    const body = c.body
+    gh.state.threads.set(c.id, { isResolved: true, resolvedBy: 'octocat', isOutdated: false })
+    const res = await later(gh, client, fixture())
+    assert.equal(res.posted, 0)
+    assert.equal(gh.state.reviewComments.length, 1)
+    assert.equal(c.body, body, 'not edited')
+    assert.equal(gh.state.requests.filter((r) => r.method === 'PATCH' && r.path.includes('/pulls/comments/')).length, 0)
+    assert.equal(mutations(gh, 'mutation').length, 0)
+    const summary = gh.state.issueComments[0].body
+    assert.ok(summary.includes('1 issue still found was resolved in the conversation, so it is not commented again.'))
+    assert.ok(!summary.includes('commented on'), 'nothing else is commented')
+    assert.ok(!summary.includes('Hero.tsx:14'), 'not listed either')
+    // Outdated as well: still not reposted. And idempotent.
+    c.line = null
+    gh.state.threads.get(c.id).isOutdated = true
+    const before = gh.state.requests.length
+    const again = await later(gh, client, fixture())
+    assert.equal(again.posted, 0)
+    assert.ok(gh.state.requests.slice(before).every(isRead))
+    // Fixed later: left as the person resolved it, not edited.
+    await later(gh, client, { ...fixture(), new_issues: [] })
+    assert.equal(c.body, body)
+  })
+})
+
+test('resolved by the Actions bot itself (GraphQL login without [bot]) is not a person', async () => {
+  await withMock({ files: FILES }, async (gh, client) => {
+    await runOnce(client, fixture())
+    const c = gh.state.reviewComments[0]
+    gh.state.threads.set(c.id, { isResolved: true, resolvedBy: 'someone-else', isOutdated: false })
+    await later(gh, client, fixture())
+    assert.ok(gh.state.issueComments[0].body.includes('resolved in the conversation'))
+    // Our own resolution, with a live marker (an edit that did not land): not a human decision.
+    gh.state.threads.set(c.id, { isResolved: true, resolvedBy: 'github-actions', isOutdated: false })
+    await later(gh, client, fixture())
+    assert.ok(!gh.state.issueComments[0].body.includes('resolved in the conversation'))
+  })
+})
+
+// ---------------------------------------------------------------------------------------------
+// File-level comments
+
+const lineless = () => {
+  const r = fixture()
+  const signup = r.new_issues[1]
+  const second = { ...signup, scanner_rule_id: 'image-alt', message: 'Images must have alternative text (image-alt)', wcag_criteria: ['1.1.1'], html_snippet: '<img src="logo.png">', fingerprint: '5a5a5a5a5a5a5a5a', suggestion: null, help_url: 'https://dequeuniversity.com/rules/axe/4.10/image-alt' }
+  return { ...r, new_issues: [r.new_issues[0], signup, second, r.new_issues[2]] }
+}
+
+test('file level: issues without a line in a changed file share one file-level comment', async () => {
+  await withMock({ files: FILES_HTML }, async (gh, client) => {
+    const res = await runOnce(client, lineless())
+    assert.equal(res.posted, 2)
+    const posts = gh.state.requests.filter((r) => r.method === 'POST' && r.path === '/repos/acme/site/pulls/42/comments')
+    assert.equal(posts.length, 1, 'file-level comments are posted one by one, outside the review')
+    assert.deepEqual([posts[0].body.path, posts[0].body.subject_type, posts[0].body.line, posts[0].body.commit_id], ['src/pages/signup.html', 'file', undefined, HEAD])
+    const body = posts[0].body.body
+    assert.deepEqual(parseInlineMarker(body).fps, ['0f1e2d3c4b5a6978', '5a5a5a5a5a5a5a5a'])
+    assert.ok(body.includes('**2 new issues in this file:**'))
+    assert.ok(body.includes('- `Form elements must have labels`\n  **Element:** `<input type="email" name="email">`'))
+    assert.ok(body.includes('**Element:** `<img src="logo.png">`'))
+    assert.ok(body.includes('no line number from the scanner'))
+    const summary = gh.state.issueComments[0].body
+    assert.ok(summary.includes('Equall found 4 new accessibility issues'))
+    assert.ok(summary.includes('3 issues commented on 1 changed line and 1 file.'))
+    assert.ok(summary.includes('`src/components/Footer.tsx:40`'))
+    assert.ok(!summary.includes('| `src/pages/signup.html`'), 'commented, so not listed')
+    // Re-run: nothing written.
+    const before = gh.state.requests.length
+    assert.deepEqual(await runOnce(client, lineless()), { skipped: false, posted: 0, marked: 0, summary: 'unchanged' })
+    assert.ok(gh.state.requests.slice(before).every(isRead))
+  })
+})
+
+test('file level: same lifecycle (partly fixed, then fixed and resolved)', async () => {
+  await withMock({ files: FILES_HTML }, async (gh, client) => {
+    await runOnce(client, lineless())
+    const file = gh.state.reviewComments.find((c) => c.subject_type === 'file')
+    const partial = lineless()
+    partial.new_issues = partial.new_issues.filter((i) => i.fingerprint !== '5a5a5a5a5a5a5a5a')
+    await later(gh, client, partial)
+    assert.ok(file.body.includes('**1 new issue in this file:**'))
+    assert.ok(file.body.includes('1 of these is no longer found on `ccccccc`.'))
+    assert.ok(gh.state.issueComments[0].body.includes('2 issues commented on 1 changed line and 1 file.'))
+    const fixed = lineless()
+    fixed.new_issues = fixed.new_issues.filter((i) => i.file_path !== 'src/pages/signup.html')
+    await later(gh, client, fixed)
+    assert.equal(parseInlineMarker(file.body).resolved, true)
+    assert.equal(gh.state.threads.get(file.id).isResolved, true)
+    assert.ok(gh.state.issueComments[0].body.includes('1 issue commented on 1 changed line.'))
+  })
+})
+
+test('file level: a new issue without a line joins the file comment already there', async () => {
+  await withMock({ files: FILES_HTML }, async (gh, client) => {
+    await runOnce(client, fixture())
+    const res = await runOnce(client, lineless())
+    assert.equal(res.posted, 0)
+    const files = gh.state.reviewComments.filter((c) => c.subject_type === 'file')
+    assert.equal(files.length, 1)
+    assert.deepEqual(parseInlineMarker(files[0].body).fps, ['0f1e2d3c4b5a6978', '5a5a5a5a5a5a5a5a'])
+  })
+})
+
+test('file level: an outdated file comment with its issues still found is replaced', async () => {
+  await withMock({ files: FILES_HTML }, async (gh, client) => {
+    await runOnce(client, fixture())
+    const old = gh.state.reviewComments.find((c) => c.subject_type === 'file')
+    gh.state.threads.set(old.id, { isResolved: false, resolvedBy: null, isOutdated: true })
+    const res = await later(gh, client, fixture())
+    assert.equal(res.posted, 1)
+    assert.equal(gh.state.minimized.get(old.id), 'OUTDATED')
+    assert.equal(gh.state.reviewComments.filter((c) => c.subject_type === 'file' && !parseInlineMarker(c.body).moved).length, 1)
+  })
+})
+
+test('file level: the scanner snippet is cut, kept on one line and inert', () => {
+  const hostile = '<a href="https://phish.example">@everyone ``x`` ![i](https://t.example/p.png)</a>' + 'x'.repeat(200)
+  const issue = { ...fixture().new_issues[1], html_snippet: `${hostile}\n<b>` }
+  const snippet = snippetOf(issue)
+  assert.equal(snippet.length, 120)
+  assert.ok(snippet.endsWith('…'))
+  assert.ok(!snippet.includes('\n'))
+  assert.equal(snippetOf({ html_snippet: '  ' }), null)
+  const body = renderInline([issue], SCOPE, { file: true })
+  for (const [kind, found] of Object.entries(liveMarkdown(body))) assert.equal(found, false, `live ${kind}\n${body}`)
+  // No snippet on line comments: the line already shows the code.
+  assert.ok(!renderInline([issue], SCOPE).includes('**Element:**'))
+})
+
+test('limit: the 10 new comments count lines and files together', async () => {
+  const lines = Array.from({ length: 14 }, (_, k) => `+line ${k}`).join('\n')
+  const files = [{ filename: 'src/Big.tsx', patch: `@@ -0,0 +1,14 @@\n${lines}` }]
+  for (const k of [1, 2, 3]) files.push({ filename: `src/p${k}.html`, patch: '@@ -0,0 +1 @@\n+<p>' })
+  const base = fixture().new_issues
+  const issues = [
+    ...Array.from({ length: 9 }, (_, k) => ({ ...base[0], file_path: 'src/Big.tsx', line: k + 1, fingerprint: `l${k}` })),
+    ...[1, 2, 3].map((k) => ({ ...base[1], file_path: `src/p${k}.html`, fingerprint: `h${k}` })),
+  ]
+  await withMock({ files }, async (gh, client) => {
+    const res = await runOnce(client, { ...fixture(), new_issues: issues })
+    assert.equal(res.posted, MAX_INLINE)
+    assert.equal(gh.state.reviewComments.length, MAX_INLINE)
+    assert.equal(gh.state.reviewComments.filter((c) => c.subject_type === 'file').length, 1)
+    const summary = gh.state.issueComments[0].body
+    assert.ok(summary.includes('10 issues commented on 9 changed lines and 1 file.'))
+    assert.ok(summary.includes('2 issues not commented inline'))
+    assert.ok(summary.includes('`src/p2.html`') && summary.includes('`src/p3.html`'))
+  })
+})
+
+test('summary: files only, and the resolved-in-conversation line', () => {
+  const result = { ...fixture(), new_issues: fixture().new_issues.slice(1, 2) }
+  const body = summaryFor(result, { listed: [], inlineLines: 0, inlineFiles: 1 })
+  assert.ok(body.includes('1 issue commented on 1 file.'))
+  const payload = buildPayload({ result: fixture(), repository: 'acme/site', pullNumber: 42, headSha: HEAD, engineVersion: null, fixed: 0 })
+  const two = renderSummary({ result: fixture(), payload, listed: [], scope: SCOPE, inlineLines: 1, resolvedInConversation: 2 })
+  assert.ok(two.includes('1 issue commented on 1 changed line.'))
+  assert.ok(two.includes('2 issues still found were resolved in the conversation, so they are not commented again.'))
+})
+
+// ---------------------------------------------------------------------------------------------
+// GraphQL client
+
+test('graphql: same origin as the API only, never follows redirects, errors carry their type', async () => {
+  let called = false
+  const evil = createClient({ apiUrl: 'https://api.github.com', token: 't', repository: 'a/b', graphqlUrl: 'https://evil.example/graphql', fetchImpl: async () => { called = true } })
+  assert.equal(evil.hasGraphql, false)
+  await assert.rejects(evil.graphql('query { viewer { login } }', {}), /not available/)
+  assert.equal(called, false)
+  const off = createClient({ apiUrl: 'https://api.github.com', token: 't', repository: 'a/b', graphqlUrl: null })
+  assert.equal(off.hasGraphql, false)
+  assert.equal(await fetchThreads(off, 'a/b', 1), null)
+  let seen
+  const ghes = createClient({
+    apiUrl: 'https://ghe.example/api/v3', token: 't', repository: 'a/b', graphqlUrl: 'https://ghe.example/api/graphql',
+    fetchImpl: async (u, init) => { seen = { u, init }; return { status: 200, json: async () => ({ data: null, errors: [{ type: 'FORBIDDEN', message: 'Resource not accessible by integration' }] }) } },
+  })
+  await assert.rejects(ghes.graphql('mutation { x }', { id: 1 }), (err) => {
+    assert.deepEqual(err.types, ['FORBIDDEN'])
+    assert.equal(isPermissionError(err), true)
+    assert.ok(!err.message.includes('Bearer'))
+    return true
+  })
+  assert.equal(seen.u, 'https://ghe.example/api/graphql')
+  assert.equal(seen.init.redirect, 'error')
+  assert.equal(seen.init.method, 'POST')
+  assert.equal(isPermissionError(new ApiError(403, 'x')), true)
+  assert.equal(isPermissionError(new ApiError(502, 'Bad Gateway')), false)
+  assert.equal(isPermissionError(Object.assign(new ApiError(200, 'Could not resolve'), { types: ['NOT_FOUND'] })), false)
+})
+
+test('graphql: review threads are read across pages', async () => {
+  await withMock({ files: FILES, pageSize: 1 }, async (gh, client) => {
+    for (const id of [1, 2, 3]) gh.state.reviewComments.push({ id, node_id: `PRRC_${id}`, user: BOT, path: 'a', line: 1, body: 'x' })
+    gh.state.threads.set(2, { isResolved: true, resolvedBy: 'octocat', isOutdated: false })
+    const threads = await fetchThreads(client, 'acme/site', 42)
+    assert.deepEqual([...threads.keys()], [1, 2, 3])
+    assert.deepEqual(threads.get(2), { id: 'T_2', isResolved: true, isOutdated: false, resolvedBy: 'octocat' })
+    assert.equal(mutations(gh, 'reviewThreads').length, 3)
+  })
+})
+
+test('markers: moved comments round-trip and never count as live', () => {
+  const original = renderInline([fixture().new_issues[0]], SCOPE)
+  const body = renderInlineMoved(original, SCOPE, ['a1b2c3d4e5f60718'], HEAD)
+  assert.deepEqual(parseInlineMarker(body), { scope: SCOPE, fps: ['a1b2c3d4e5f60718'], gone: [], resolved: false, moved: true })
+  assert.ok(body.includes('img elements must have an alt prop'))
+  assert.equal((body.match(/<!-- equall:inline/g) ?? []).length, 1)
 })
 
 // ---------------------------------------------------------------------------------------------
