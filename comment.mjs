@@ -1,11 +1,19 @@
 // Comments on a pull request with what the change introduced, and only that.
 //
 // Two layers, both kept quiet on purpose:
-//   - one inline review comment per new issue, on its line, when that line is part of the
-//     pull request diff (at most MAX_INLINE per run, never twice for the same issue);
+//   - review comments on the pull request diff: one per changed line that has new issues, and
+//     one file-level comment per changed file for the new issues the scanner gives no line for
+//     (at most MAX_INLINE new comments per run, never twice for the same issue);
 //   - one summary comment, found again and updated through a hidden marker. It is created
 //     only when the change introduces at least one new issue; once it exists, later runs keep
 //     it current, down to the state where nothing new is found.
+//
+// Review comments follow their issues by fingerprint, never by line:
+//   - all of a comment's issues gone: its text says so, then its thread is resolved (needs
+//     `contents: write`), or else the comment is hidden as resolved, or else deleted;
+//   - the comment went outdated but its issues are still found: they are commented again where
+//     they are now, and the old comment is hidden as outdated (or deleted);
+//   - a thread someone resolved by hand stays resolved: its issues are not commented again.
 //
 // Every marker carries a scope (workflow, job, path and level), so several jobs commenting on
 // the same pull request each keep their own comments.
@@ -28,6 +36,7 @@ export const MAX_PAYLOAD_ISSUES = 50
 const MAX_LISTED = 100
 const MAX_FILES_LISTED = 5
 const MAX_PAGES = 30
+const MAX_SNIPPET = 120
 const COMMENT_ACTIONS = ['opened', 'synchronize', 'reopened', 'ready_for_review']
 const SEVERITIES = ['critical', 'serious', 'moderate', 'minor']
 const SHA = /^[0-9a-f]{40}$/
@@ -149,28 +158,42 @@ export function howToFix(issue) {
 
 export const summaryMarker = (scope) => `${SUMMARY_MARKER} scope=${scope} -->`
 
-// One inline comment per changed line. Its marker lists every fingerprint the comment covers
-// (sorted), the ones no longer found (`gone`), and whether all of them are gone.
-export function inlineMarker(scope, fps, { gone = [], resolved = false } = {}) {
-  const g = gone.length > 0 && !resolved ? ` gone=${[...gone].sort().join(',')}` : ''
-  return `<!-- equall:inline scope=${scope} fp=${[...fps].sort().join(',')}${g}${resolved ? ' state=resolved' : ''} -->`
+// One review comment per changed line (or per file, for issues without a line). Its marker
+// lists every fingerprint the comment covers (sorted), the ones no longer found (`gone`), and
+// its state: `resolved` (all of them gone) or `moved` (outdated, commented again elsewhere).
+export function inlineMarker(scope, fps, { gone = [], resolved = false, moved = false } = {}) {
+  const closed = resolved || moved
+  const g = gone.length > 0 && !closed ? ` gone=${[...gone].sort().join(',')}` : ''
+  const state = moved ? ' state=moved' : resolved ? ' state=resolved' : ''
+  return `<!-- equall:inline scope=${scope} fp=${[...fps].sort().join(',')}${g}${state} -->`
 }
 
 const FP_LIST = '[A-Za-z0-9_-]{1,64}(?:,[A-Za-z0-9_-]{1,64})*'
-const MARKER = new RegExp(`^<!-- equall:inline scope=([0-9a-f]{8}) fp=(${FP_LIST})(?: gone=(${FP_LIST}))?( state=resolved)? -->`)
+const MARKER = new RegExp(`^<!-- equall:inline scope=([0-9a-f]{8}) fp=(${FP_LIST})(?: gone=(${FP_LIST}))?(?: state=(resolved|moved))? -->`)
 
-// Parses an Equall inline comment marker: { scope, fps, gone, resolved } or null.
+// Parses an Equall inline comment marker: { scope, fps, gone, resolved, moved } or null.
 export function parseInlineMarker(body) {
   const m = MARKER.exec(String(body ?? ''))
-  return m ? { scope: m[1], fps: m[2].split(','), gone: m[3] ? m[3].split(',') : [], resolved: Boolean(m[4]) } : null
+  return m
+    ? { scope: m[1], fps: m[2].split(','), gone: m[3] ? m[3].split(',') : [], resolved: m[4] === 'resolved', moved: m[4] === 'moved' }
+    : null
 }
 
 const criterionLabel = (c) => (WCAG_NAMES[c] ? `WCAG ${c} ${WCAG_NAMES[c]}` : `WCAG ${c}`)
 
-function footer(issues) {
+function footer(issues, { file = false } = {}) {
   const rules = [...new Set(issues.map((i) => i.scanner_rule_id))].map((r) => codeSpan(r)).join(', ')
   const criteria = [...new Set(issues.flatMap(criteriaOf))].map(criterionLabel)
-  return `<sub>Equall · new in this pull request · ${rules}${criteria.length ? ` · ${criteria.join(', ')}` : ''}</sub>`
+  const where = file ? ' · no line number from the scanner' : ''
+  return `<sub>Equall · new in this pull request${where} · ${rules}${criteria.length ? ` · ${criteria.join(', ')}` : ''}</sub>`
+}
+
+// The element an issue is about, for file-level comments: the scanner gives no line, so the
+// snippet is what lets the reader find it. One line, cut at MAX_SNIPPET characters.
+export function snippetOf(issue) {
+  const s = String(issue?.html_snippet ?? '').replace(/\s+/g, ' ').trim()
+  if (s === '') return null
+  return s.length > MAX_SNIPPET ? `${s.slice(0, MAX_SNIPPET - 1)}…` : s
 }
 
 // In a list item: the rule's guidance link, or the lead line of the CLI's hint.
@@ -182,42 +205,54 @@ function shortFix(issue) {
   return lead && hint !== 'Auto-fixable' ? `**How to fix:** ${codeSpan(lead)}` : null
 }
 
-// The comment for the new issues on one line. `fps`: every fingerprint the comment covers;
-// `gone`: those no longer found by the check on `sha`. One issue and nothing gone: the short
-// form. Otherwise a list, one item per issue still found.
-export function renderInline(issues, scope, { fps = issues.map((i) => i.fingerprint), gone = [], sha = '' } = {}) {
+// The comment for the new issues on one line, or (`file`) in one file when the scanner gives
+// them no line. `fps`: every fingerprint the comment covers; `gone`: those no longer found by
+// the check on `sha`. One issue and nothing gone: the short form. Otherwise a list, one item
+// per issue still found.
+export function renderInline(issues, scope, { fps = issues.map((i) => i.fingerprint), gone = [], sha = '', file = false } = {}) {
   const marker = inlineMarker(scope, fps, { gone })
+  const element = (i) => {
+    const snippet = file ? snippetOf(i) : null
+    return snippet ? `**Element:** ${codeSpan(snippet)}` : null
+  }
   if (issues.length === 1 && gone.length === 0) {
     const [issue] = issues
-    return [marker, `**New issue:** ${codeSpan(plainMessage(issue))}`, '', whyItMatters(issue.wcag_criteria), '', howToFix(issue), '', footer(issues)]
+    return [marker, `**New issue:** ${codeSpan(plainMessage(issue))}`, '', element(issue), '', whyItMatters(issue.wcag_criteria), '', howToFix(issue), '', footer(issues, { file })]
       .filter((l) => l !== null)
       .join('\n')
       .replace(/\n{3,}/g, '\n\n')
   }
   const items = issues.map((i) => {
     const detail = [whyItMatters(i.wcag_criteria), shortFix(i)].filter(Boolean).join(' ')
-    return `- ${codeSpan(plainMessage(i))}${detail ? `\n  ${detail}` : ''}`
+    const el = element(i)
+    return `- ${codeSpan(plainMessage(i))}${el ? `\n  ${el}` : ''}${detail ? `\n  ${detail}` : ''}`
   })
-  const lines = [marker, `**${plural(issues.length, 'new issue', 'new issues')} on this line:**`, '', ...items]
+  const where = file ? 'in this file' : 'on this line'
+  const lines = [marker, `**${plural(issues.length, 'new issue', 'new issues')} ${where}:**`, '', ...items]
   if (gone.length > 0) {
     lines.push('', `${gone.length} of these ${gone.length === 1 ? 'is' : 'are'} no longer found on ${codeSpan(String(sha).slice(0, 7))}.`)
   }
-  lines.push('', footer(issues))
+  lines.push('', footer(issues, { file }))
   return lines.join('\n')
 }
 
-// An inline comment none of whose issues the latest check finds: kept, marked, never deleted.
+const previousText = (body) => String(body).replace(/^<!-- equall:inline[^>]*-->\n?/, '')
+const folded = (body) => ['<details><summary>Previous comment</summary>', '', previousText(body), '', '</details>']
+
+// A comment none of whose issues the latest check finds: its text says so (the original stays,
+// folded) before its thread is resolved, hidden or deleted.
 export function renderInlineResolved(previousBody, scope, fps, sha) {
-  const original = String(previousBody).replace(/^<!-- equall:inline[^>]*-->\n?/, '')
+  return [inlineMarker(scope, fps, { resolved: true }), `No longer found by the check on ${codeSpan(String(sha).slice(0, 7))}.`, '', ...folded(previousBody)].join('\n')
+}
+
+// An outdated comment whose issues are still found: they are commented again where they are
+// now (or listed in the summary), and this one is hidden as outdated.
+export function renderInlineMoved(previousBody, scope, fps, sha) {
   return [
-    inlineMarker(scope, fps, { resolved: true }),
-    `No longer found by the check on ${codeSpan(String(sha).slice(0, 7))}.`,
+    inlineMarker(scope, fps, { moved: true }),
+    `The code this comment pointed to changed. The issues still found by the check on ${codeSpan(String(sha).slice(0, 7))} are commented again where they are now, or listed in the summary.`,
     '',
-    '<details><summary>Previous comment</summary>',
-    '',
-    original,
-    '',
-    '</details>',
+    ...folded(previousBody),
   ].join('\n')
 }
 
@@ -271,8 +306,12 @@ export function buildPayload({ result, repository, pullNumber, headSha, engineVe
 
 // `listed`: the new issues not shown inline. `pullRequestUrl`: validated, or null.
 // `fixedAtLeast`: the previous list was cut, so the fixed count is a lower bound.
-// `inlineLines`: how many changed lines carry the inline comments of the issues not listed.
-export function renderSummary({ result, payload, listed, pullRequestUrl, scope, scanPath = '.', fixedAtLeast = false, inlineLines = 0 }) {
+// `inlineLines` and `inlineFiles`: how many changed lines and files carry the review comments
+// of the issues not listed. `resolvedInConversation`: new issues whose thread someone resolved
+// by hand, so they are neither commented again nor listed.
+export function renderSummary({
+  result, payload, listed, pullRequestUrl, scope, scanPath = '.', fixedAtLeast = false, inlineLines = 0, inlineFiles = 0, resolvedInConversation = 0,
+}) {
   const n = payload.counts.new
   const fixed = payload.counts.fixed
   const fixedText = fixed > 0 ? ` ${fixedAtLeast ? 'At least ' : ''}${plural(fixed, 'issue', 'issues')} fixed since the last check.` : ''
@@ -280,8 +319,18 @@ export function renderSummary({ result, payload, listed, pullRequestUrl, scope, 
   const lines = [summaryMarker(scope), `### Equall${path !== '.' ? ` · ${codeSpan(path)}` : ''}`, '']
   if (n > 0) {
     lines.push(`Equall found ${plural(n, 'new accessibility issue', 'new accessibility issues')} in this pull request.${fixedText}`)
-    const inline = n - listed.length
-    if (inline > 0) lines.push('', `${plural(inline, 'issue', 'issues')} commented on ${plural(Math.max(inlineLines, 1), 'changed line', 'changed lines')}.`)
+    const inline = n - listed.length - resolvedInConversation
+    if (inline > 0) {
+      const where = [
+        inlineLines > 0 || inlineFiles === 0 ? plural(Math.max(inlineLines, 1), 'changed line', 'changed lines') : null,
+        inlineFiles > 0 ? plural(inlineFiles, 'file', 'files') : null,
+      ].filter(Boolean)
+      lines.push('', `${plural(inline, 'issue', 'issues')} commented on ${where.join(' and ')}.`)
+    }
+    if (resolvedInConversation > 0) {
+      const k = resolvedInConversation
+      lines.push('', `${plural(k, 'issue', 'issues')} still found ${k === 1 ? 'was' : 'were'} resolved in the conversation, so ${k === 1 ? 'it is' : 'they are'} not commented again.`)
+    }
   } else {
     lines.push(`No new accessibility issue found by static checks in this pull request.${fixedText}`)
   }
@@ -367,9 +416,18 @@ export class ApiError extends Error {
   }
 }
 
-export function createClient({ apiUrl, token, repository, fetchImpl = fetch }) {
+// `graphqlUrl`: defaults to `<apiUrl>/graphql`; null turns GraphQL off. It must be on the same
+// origin as the REST API, or GraphQL stays off: the token never goes anywhere else.
+export function createClient({ apiUrl, token, repository, graphqlUrl, fetchImpl = fetch }) {
   const base = apiUrl.replace(/\/+$/, '')
   const origin = new URL(base).origin
+  const gqlUrl = graphqlUrl === undefined ? `${base}/graphql` : graphqlUrl
+  let gqlOn = false
+  try {
+    gqlOn = Boolean(gqlUrl) && new URL(gqlUrl).origin === origin
+  } catch {
+    gqlOn = false
+  }
   const headers = {
     Authorization: `Bearer ${token}`,
     Accept: 'application/vnd.github+json',
@@ -413,7 +471,62 @@ export function createClient({ apiUrl, token, repository, fetchImpl = fetch }) {
       return null
     }
   }
-  return { call, paginate, whoami }
+  // GraphQL answers 200 with an `errors` array when it refuses: that is an error too, carrying
+  // the error types (FORBIDDEN, NOT_FOUND...) for isPermissionError.
+  async function graphql(query, variables, context = 'GraphQL') {
+    if (!gqlOn) throw new ApiError(0, 'GraphQL is not available on the API origin', context)
+    const { data } = await request('POST', gqlUrl, { query, variables }, context)
+    if (Array.isArray(data?.errors) && data.errors.length > 0) {
+      const err = new ApiError(200, data.errors.map((e) => String(e?.message ?? 'error')).join('; '), context)
+      err.types = data.errors.map((e) => e?.type).filter(Boolean)
+      throw err
+    }
+    return data?.data ?? null
+  }
+  return { call, paginate, whoami, graphql, hasGraphql: gqlOn }
+}
+
+// A refusal for lack of permission, from REST or GraphQL ("Resource not accessible by
+// integration" is what the workflow token gets without `contents: write`).
+export function isPermissionError(err) {
+  if (!err) return false
+  if (err.status === 401 || err.status === 403) return true
+  if ((err.types ?? []).some((t) => t === 'FORBIDDEN' || t === 'INSUFFICIENT_SCOPES')) return true
+  return /not accessible by integration|insufficient scopes|must have (?:push|write|admin) access/i.test(String(err.message ?? ''))
+}
+
+const THREADS_QUERY = `query($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { id isResolved isOutdated resolvedBy { login } comments(first: 1) { nodes { databaseId } } }
+      }
+    }
+  }
+}`
+const RESOLVE_MUTATION = 'mutation($id: ID!) { resolveReviewThread(input: { threadId: $id }) { thread { id isResolved } } }'
+const MINIMIZE_MUTATION = 'mutation($id: ID!, $classifier: ReportedContentClassifiers!) { minimizeComment(input: { subjectId: $id, classifier: $classifier }) { minimizedComment { isMinimized } } }'
+
+// The pull request's review threads, by the database id of their first comment. null when
+// GraphQL is not available: the lifecycle then works from the REST data alone.
+export async function fetchThreads(client, repository, number) {
+  if (!client.graphql || !client.hasGraphql) return null
+  const [owner, name] = String(repository).split('/')
+  const threads = new Map()
+  let after = null
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const data = await client.graphql(THREADS_QUERY, { owner, name, number, after }, 'GraphQL reviewThreads')
+    const conn = data?.repository?.pullRequest?.reviewThreads
+    if (!conn) break
+    for (const t of conn.nodes ?? []) {
+      const first = t?.comments?.nodes?.[0]?.databaseId
+      if (Number.isInteger(first)) threads.set(first, { id: t.id, isResolved: Boolean(t.isResolved), isOutdated: Boolean(t.isOutdated), resolvedBy: t.resolvedBy?.login ?? null })
+    }
+    if (!conn.pageInfo?.hasNextPage) break
+    after = conn.pageInfo.endCursor
+  }
+  return threads
 }
 
 // Writes are independent: one refused write is logged and the others still run. A 401 or 403
@@ -468,22 +581,77 @@ export function countFixed({ previous, previousBody = '', sha, current, unchecke
   return { fixed: gone.length, atLeast: previous.truncated === true }
 }
 
-// Equall's live inline comments of this scope, by fingerprint. An outdated comment (its line
-// is gone after a push) no longer shows the issue: it counts as absent.
-// Equall's live inline comments of this scope. An outdated comment (its line is gone after a
-// push) no longer shows its issues: it counts as absent.
-function liveInline(comments, ours, scope) {
+// Equall's review comments of this scope (line-level and file-level), with what their thread
+// says. Comments marked `moved` were replaced by a newer one: they no longer count.
+//   outdated       GitHub no longer shows it on the current diff (REST `line` null, or the
+//                  thread is outdated)
+//   humanResolved  its thread was resolved by someone else while its issues were open
+function collectInline(comments, ours, isOurLogin, scope, threads) {
+  const answered = new Set(comments.map((c) => c.in_reply_to_id).filter(Boolean))
   const entries = []
   for (const c of comments) {
-    if (!ours(c) || c.line === null || c.line === undefined) continue
+    if (!ours(c) || c.in_reply_to_id) continue
     const marker = parseInlineMarker(c.body)
-    if (marker && marker.scope === scope) entries.push({ ...marker, comment: c, added: [] })
+    if (!marker || marker.scope !== scope || marker.moved) continue
+    const file = c.subject_type === 'file'
+    const thread = threads?.get(c.id) ?? null
+    const outdated = (!file && (c.line === null || c.line === undefined)) || thread?.isOutdated === true
+    const humanResolved = thread?.isResolved === true && !marker.resolved && !isOurLogin(thread.resolvedBy)
+    entries.push({ ...marker, comment: c, file, outdated, thread, humanResolved, answered: answered.has(c.id), added: [] })
   }
   return entries
 }
 
 const sameSet = (a, b) => a.length === b.length && a.every((x) => b.includes(x))
 const lineKey = (path, line) => `${path}\0${line}`
+const fileKey = (path) => `${path}\0file`
+const entryKey = (e) => (e.file ? fileKey(e.comment.path) : lineKey(e.comment.path, e.comment.line))
+
+// Closes a review comment whose text already says why: resolves its thread, or else hides it,
+// or else deletes it. What the token cannot do is remembered for the rest of the run, so a
+// permission error is met once, not once per comment. A comment someone answered is never
+// deleted: the conversation would go with it.
+function createCloser({ client, write, log }) {
+  const can = { resolve: true, minimize: true }
+  let hiddenWithoutResolve = 0
+  async function close(e, classifier) {
+    if (classifier === 'RESOLVED' && can.resolve && e.thread?.id) {
+      try {
+        await client.graphql(RESOLVE_MUTATION, { id: e.thread.id }, 'GraphQL resolveReviewThread')
+        return 'resolved'
+      } catch (err) {
+        if (isPermissionError(err)) can.resolve = false
+        else log.debug(`Could not resolve a review thread (${err.message}).`)
+      }
+    }
+    const fallback = classifier === 'RESOLVED' && !can.resolve
+    if (can.minimize && e.comment.node_id && client.hasGraphql) {
+      try {
+        await client.graphql(MINIMIZE_MUTATION, { id: e.comment.node_id, classifier }, 'GraphQL minimizeComment')
+        if (fallback) hiddenWithoutResolve++
+        return 'minimized'
+      } catch (err) {
+        if (isPermissionError(err)) can.minimize = false
+        else log.debug(`Could not hide a review comment (${err.message}).`)
+      }
+    }
+    if (e.answered) return 'kept'
+    const del = await write('delete a review comment', 'DELETE', `/pulls/comments/${e.comment.id}`, undefined)
+    if (del.ok) {
+      if (fallback) hiddenWithoutResolve++
+      return 'deleted'
+    }
+    return 'kept'
+  }
+  function explain() {
+    if (hiddenWithoutResolve === 0) return
+    log.notice(
+      'The comments of fixed issues were hidden or deleted, because the workflow token cannot resolve review threads. ' +
+        'Granting `contents: write` lets Equall resolve them instead; it is not needed, and the README explains why it is not the default.',
+    )
+  }
+  return { close, explain }
+}
 
 export async function run({ result, event, eventName, actor, client, engineVersion, pullRequestUrl, log, scope, scanPath = '.' }) {
   const skip = skipReason({ eventName, event, actor })
@@ -506,14 +674,27 @@ export async function run({ result, event, eventName, actor, client, engineVersi
   const own = await client.whoami()
   const logins = new Set([DEFAULT_LOGIN, ...(own ? [own] : [])])
   const ours = (c) => logins.has(c?.user?.login)
+  // GraphQL names the Actions bot without its `[bot]` suffix.
+  const bare = new Set([...logins].map((l) => l.replace(/\[bot\]$/, '')))
+  const isOurLogin = (login) => typeof login === 'string' && bare.has(login.replace(/\[bot\]$/, ''))
   const write = createWriter(client, log)
 
-  // 1. Where an inline comment can go: the RIGHT side lines of each file's patch.
+  // 1. Where a review comment can go: the RIGHT side lines of each file's patch, and the
+  //    changed files themselves (file-level comments).
   const files = await client.paginate(`/pulls/${n}/files`)
   const commentable = new Map(files.map((f) => [f.filename, commentableLines(f.patch)]))
 
-  // 2. Equall's live inline comments of this scope.
-  const existing = liveInline(await client.paginate(`/pulls/${n}/comments`), ours, scope)
+  // 2. Equall's review comments of this scope, with their threads when GraphQL answers.
+  const reviewComments = await client.paginate(`/pulls/${n}/comments`)
+  let threads = null
+  if (reviewComments.some((c) => ours(c) && parseInlineMarker(c.body)?.scope === scope)) {
+    try {
+      threads = await fetchThreads(client, repository, n)
+    } catch (err) {
+      log.debug(`Could not read the review threads (${err.message}): outdated comments are told by their line only.`)
+    }
+  }
+  const existing = collectInline(reviewComments, ours, isOurLogin, scope, threads)
 
   // 3. The summary of this scope, if any.
   const issueComments = await client.paginate(`/issues/${n}/comments`)
@@ -532,107 +713,141 @@ export async function run({ result, event, eventName, actor, client, engineVersi
     return { skipped: true }
   }
 
-  // 5. New issues: already in a comment, joining the comment already on their line, in a new
-  //    comment for their line, or listed in the summary.
+  // 5. Which comments still show their issues. Closed ones (resolved, outdated) do not: their
+  //    issues still found are placed again. A thread resolved by hand keeps its issues quiet.
   const current = new Map(newIssues.filter((i) => i.fingerprint).map((i) => [i.fingerprint, i]))
   const byFp = new Map()
-  const byLine = new Map()
+  const byKey = new Map()
   for (const e of existing) {
+    if (e.humanResolved || e.resolved || e.outdated) continue
     for (const fp of e.fps) if (!byFp.has(fp)) byFp.set(fp, e)
-    const key = lineKey(e.comment.path, e.comment.line)
-    if (!byLine.has(key)) byLine.set(key, e)
+    const key = entryKey(e)
+    if (!byKey.has(key)) byKey.set(key, e)
   }
+  const quiet = new Set()
+  for (const e of existing) if (e.humanResolved) for (const fp of e.fps) if (current.has(fp) && !byFp.has(fp)) quiet.add(fp)
+
+  // 6. New issues: already in a comment, resolved in the conversation, joining the comment
+  //    already on their line (or file), in a new comment, or listed in the summary. An issue
+  //    without a line gets a file-level comment when its file is part of the pull request.
   const groups = new Map()
   const listed = []
   for (const issue of newIssues) {
     const fp = issue.fingerprint
-    if (fp && byFp.has(fp)) continue
-    const onDiff = inlineAllowed && FINGERPRINT.test(fp ?? '') && Number.isInteger(issue.line) && commentable.get(issue.file_path)?.has(issue.line)
-    if (!onDiff) {
+    if (fp && (byFp.has(fp) || quiet.has(fp))) continue
+    let key = null
+    if (inlineAllowed && FINGERPRINT.test(fp ?? '')) {
+      const hasLine = Number.isInteger(issue.line) && issue.line > 0
+      if (hasLine && commentable.get(issue.file_path)?.has(issue.line)) key = lineKey(issue.file_path, issue.line)
+      else if (!hasLine && commentable.has(issue.file_path)) key = fileKey(issue.file_path)
+    }
+    if (!key) {
       listed.push(issue)
       continue
     }
-    const key = lineKey(issue.file_path, issue.line)
-    const there = byLine.get(key)
+    const there = byKey.get(key)
     if (there) {
       there.added.push(fp)
       byFp.set(fp, there)
     } else {
-      if (!groups.has(key)) groups.set(key, [])
-      groups.get(key).push(issue)
+      if (!groups.has(key)) groups.set(key, { file: key.endsWith('\0file'), issues: [] })
+      groups.get(key).issues.push(issue)
     }
   }
-  // At most MAX_INLINE new comments; the issues of the other lines go to the summary.
-  const toPost = [...groups.values()].slice(0, MAX_INLINE)
-  for (const group of [...groups.values()].slice(MAX_INLINE)) listed.push(...group)
+  // At most MAX_INLINE new comments, lines and files together; the rest goes to the summary.
+  const all = [...groups.values()]
+  const toPost = all.slice(0, MAX_INLINE)
+  for (const group of all.slice(MAX_INLINE)) listed.push(...group.issues)
   const shownLines = new Set()
+  const shownFiles = new Set()
+  const show = (path, line, file) => (file ? shownFiles.add(path) : shownLines.add(lineKey(path, line)))
 
-  // 6. The new comments, as one review (one notification). If the review fails, it may still
-  //    have been created (a timeout, a 5xx): list the comments again, then post the missing
-  //    ones one by one. Whatever still fails goes to the summary list.
+  // 7. The new comments. Line comments go as one review (one notification). If the review
+  //    fails, it may still have been created (a timeout, a 5xx): list the comments again, then
+  //    post the missing ones one by one. File-level comments cannot be part of a review: they
+  //    are posted one by one. Whatever still fails goes to the summary list.
   let posted = 0
-  if (toPost.length > 0) {
+  const lineGroups = toPost.filter((g) => !g.file).map((g) => g.issues)
+  const fileGroups = toPost.filter((g) => g.file).map((g) => g.issues)
+  const done = (g, file) => {
+    posted++
+    show(g[0].file_path, g[0].line, file)
+  }
+  if (lineGroups.length > 0) {
     const comment = (g) => ({ path: g[0].file_path, line: g[0].line, side: 'RIGHT', body: renderInline(g, scope) })
-    const review = await write('post the review', 'POST', `/pulls/${n}/reviews`, { commit_id: eventHead, event: 'COMMENT', comments: toPost.map(comment) }, { quiet: true })
-    const done = (g) => {
-      posted++
-      shownLines.add(lineKey(g[0].file_path, g[0].line))
-    }
+    const review = await write('post the review', 'POST', `/pulls/${n}/reviews`, { commit_id: eventHead, event: 'COMMENT', comments: lineGroups.map(comment) }, { quiet: true })
     if (review.ok) {
-      toPost.forEach(done)
+      lineGroups.forEach((g) => done(g, false))
     } else {
-      const present = new Set(liveInline(await client.paginate(`/pulls/${n}/comments`), ours, scope).flatMap((e) => e.fps))
-      for (const group of toPost) {
+      const again = collectInline(await client.paginate(`/pulls/${n}/comments`), ours, isOurLogin, scope, null)
+      const present = new Set(again.filter((e) => !e.resolved && !e.outdated).flatMap((e) => e.fps))
+      for (const group of lineGroups) {
         if (group.every((i) => present.has(i.fingerprint))) {
-          done(group)
+          done(group, false)
           continue
         }
         const single = await write(`comment on ${group[0].file_path}:${group[0].line}`, 'POST', `/pulls/${n}/comments`, { commit_id: eventHead, ...comment(group) })
-        if (single.ok) done(group)
+        if (single.ok) done(group, false)
         else listed.push(...group)
       }
     }
   }
+  for (const group of fileGroups) {
+    const body = renderInline(group, scope, { file: true })
+    const res = await write(`comment on ${group[0].file_path}`, 'POST', `/pulls/${n}/comments`, { commit_id: eventHead, path: group[0].file_path, subject_type: 'file', body })
+    if (res.ok) done(group, true)
+    else listed.push(...group)
+  }
 
-  // 7. Existing comments follow their issues: restored when they come back, edited to the
-  //    remaining ones when some are gone, marked (never deleted) when all are gone. A file the
-  //    scanner could not analyse this time says nothing about its issues: left as it is.
+  // 8. Existing comments follow their issues: edited to the remaining ones when some are gone;
+  //    closed when all are gone; replaced when outdated with issues still found (those were
+  //    placed again in 6). A file the scanner could not analyse this time says nothing about
+  //    its issues: left as it is. A thread resolved by hand, or already closed, is not touched.
   const unchecked = new Set((result.unchecked ?? []).map((u) => u.file_path))
+  const closer = createCloser({ client, write, log })
   let marked = 0
   for (const e of existing) {
+    if (e.humanResolved || e.resolved) continue
     const fps = [...new Set([...e.fps, ...e.added])].sort()
     const present = fps.filter((fp) => current.has(fp))
     const gone = fps.filter((fp) => !current.has(fp))
-    const key = lineKey(e.comment.path, e.comment.line)
+    const path = e.comment.path
     if (present.length === 0) {
-      if (e.resolved || unchecked.has(e.comment.path)) continue
+      if (unchecked.has(path)) continue
       const res = await write('mark an inline comment as no longer found', 'PATCH', `/pulls/comments/${e.comment.id}`, { body: renderInlineResolved(e.comment.body, scope, fps, scanned) })
-      if (res.ok) marked++
+      if (!res.ok) continue
+      marked++
+      await closer.close(e, 'RESOLVED')
       continue
     }
-    const unchanged = !e.resolved && e.added.length === 0 && sameSet(e.gone, gone)
-    if (unchanged || (unchecked.has(e.comment.path) && e.added.length === 0 && !e.resolved)) {
-      shownLines.add(key)
+    if (e.outdated) {
+      const res = await write('mark an outdated inline comment', 'PATCH', `/pulls/comments/${e.comment.id}`, { body: renderInlineMoved(e.comment.body, scope, fps, scanned) })
+      if (res.ok) await closer.close(e, 'OUTDATED')
       continue
     }
-    const body = renderInline(present.map((fp) => current.get(fp)), scope, { fps, gone, sha: scanned })
+    const unchanged = e.added.length === 0 && sameSet(e.gone, gone)
+    if (unchanged || (unchecked.has(path) && e.added.length === 0)) {
+      show(path, e.comment.line, e.file)
+      continue
+    }
+    const body = renderInline(present.map((fp) => current.get(fp)), scope, { fps, gone, sha: scanned, file: e.file })
     const res = await write('update an inline comment', 'PATCH', `/pulls/comments/${e.comment.id}`, { body })
-    if (res.ok) {
-      shownLines.add(key)
-    } else {
-      // Its issues stay visible: the previous text if they were in it, the summary otherwise.
-      for (const fp of e.added) listed.push(current.get(fp))
-      if (!e.resolved) shownLines.add(key)
-      else for (const fp of present) if (!e.added.includes(fp)) listed.push(current.get(fp))
-    }
+    // When the edit fails, the issues already in its text stay visible there; the added ones
+    // go to the summary.
+    if (!res.ok) for (const fp of e.added) listed.push(current.get(fp))
+    show(path, e.comment.line, e.file)
   }
+  closer.explain()
 
-  // 8. The summary: created only when something new was found, then kept current.
+  // 9. The summary: created only when something new was found, then kept current.
   if (!summary && newIssues.length === 0) return { skipped: false, posted, marked, summary: 'none' }
   const previous = summary ? parseData(summary.body) : null
   const { fixed, atLeast } = countFixed({ previous, previousBody: summary?.body, sha: scanned, current, unchecked })
   const payload = buildPayload({ result, repository, pullNumber: n, headSha: scanned, engineVersion, fixed })
-  const body = renderSummary({ result, payload, listed, pullRequestUrl, scope, scanPath, fixedAtLeast: atLeast, inlineLines: shownLines.size })
+  const body = renderSummary({
+    result, payload, listed, pullRequestUrl, scope, scanPath, fixedAtLeast: atLeast,
+    inlineLines: shownLines.size, inlineFiles: shownFiles.size, resolvedInConversation: quiet.size,
+  })
   if (!summary) {
     const res = await write('post the summary comment', 'POST', `/issues/${n}/comments`, { body })
     return { skipped: false, posted, marked, summary: res.ok ? 'created' : 'failed' }
@@ -694,7 +909,10 @@ async function main(argv, env) {
     return
   }
   const event = JSON.parse(readFileSync(env.GITHUB_EVENT_PATH, 'utf8'))
-  const client = createClient({ apiUrl, token, repository: event.repository?.full_name ?? env.GITHUB_REPOSITORY })
+  // GraphQL resolves and hides review threads. Off when its URL is not https (or http on
+  // localhost) on the API's own origin: the lifecycle then falls back to deleting comments.
+  const graphqlUrl = env.GITHUB_GRAPHQL_URL || `${apiUrl.replace(/\/+$/, '')}/graphql`
+  const client = createClient({ apiUrl, token, repository: event.repository?.full_name ?? env.GITHUB_REPOSITORY, graphqlUrl: isAllowedUrl(graphqlUrl) ? graphqlUrl : null })
   const scanPath = env.EQUALL_SCAN_PATH || '.'
   const scope = computeScope({ workflow: env.GITHUB_WORKFLOW, job: env.GITHUB_JOB, path: scanPath, level: env.EQUALL_LEVEL })
   try {
