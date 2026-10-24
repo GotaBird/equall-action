@@ -35,7 +35,7 @@ inputs:
     required: false
     default: ''
   comment:
-    description: "Comment on the pull request with the issues it introduces: inline on the changed lines, plus one summary kept up to date. Needs `permissions: pull-requests: write`."
+    description: "Comment on the pull request with the issues it introduces: inline on the changed lines (or on the file when a scanner gives no line), plus one summary kept up to date. Needs `permissions: pull-requests: write`."
     required: false
     default: 'false'
 
