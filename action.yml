@@ -25,7 +25,7 @@ inputs:
   version:
     description: 'equall-cli version range to run.'
     required: false
-    default: '^0.3.4'
+    default: '^0.4.0'
   report-to:
     description: 'Equall ingest URL. When set with project-key, each pull request check is reported to Equall. Empty: nothing leaves the runner.'
     required: false

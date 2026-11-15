@@ -64,7 +64,7 @@ jobs:
             ok(body.pr_number === Number(process.env.PR_NUMBER), "pr_number")
             ok(body.head_sha === process.env.HEAD_SHA, "head_sha must be the pull request head")
             ok(body.project_key === "00000000-0000-4000-8000-000000000000", "project_key")
-            ok(/^0\.3\.\d+/.test(body.engine_version), "engine_version")
+            ok(/^0\.4\.\d+/.test(body.engine_version), "engine_version")
             ok(!/html_snippet|suggestion|help_url/.test(JSON.stringify(body)), "a finding leaked a disallowed field")
             console.log("report OK:", body.findings.length, "finding(s)")
           '
