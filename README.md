@@ -30,7 +30,7 @@ Each new finding is annotated on its file and line in the pull request.
 | `path` | `.` | Path to scan, relative to the repository root. |
 | `base` | the pull request target branch | Git ref to compare against. |
 | `level` | `AA` | WCAG conformance target: `A`, `AA` or `AAA`. |
-| `version` | `^0.3.4` | equall-cli version range to run. |
+| `version` | `^0.4.0` | equall-cli version range to run. |
 | `report-to` | empty | Equall ingest URL. With `project-key`, reports each check to Equall (see below). Empty: nothing leaves the runner. |
 | `project-key` | empty | The project's key from its settings on Equall. Not a secret: pass it as a repository variable. |
 | `comment` | `false` | Comment on the pull request with the issues it introduces (see below). Needs `permissions: pull-requests: write`. |
